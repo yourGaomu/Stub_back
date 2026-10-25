@@ -38,23 +38,22 @@ type Actor struct {
 	UserID      uuid.UUID
 	WorkspaceID uuid.UUID
 	Role        string
-	B
+	BusinessID  string
+	APIKeyID    *uuid.UUID
 }
 
 type RequestMeta struct {
-	SourceIP  string
 	SourceIP     string
 	UserAgent    string
 	RequestID    string
 	AuditDetails map[string]any
+}
 
 type linkRecord struct {
 	ID              uuid.UUID
 	WorkspaceID     uuid.UUID
 	Title           string
-
 	BusinessID      string
-
 	Tags            []string
 	TargetType      string
 	TargetURL       sql.NullString
@@ -149,13 +148,7 @@ func (s *Service) Create(ctx context.Context, actor Actor, input CreateRequest, 
 		actor.Role = role
 	}
 	var assetID *uuid.UUID
-var assetID *uuid.UUID
-	var assetBusinessID string
-	if actor.BusinessID != "" {
-		assetBusinessID = actor.BusinessID
-	}
-	target := Target
-	var assetBusinessID string
+	assetBusinessID := actor.BusinessID
 	target := TargetDTO{Type: input.Target.Type, URL: input.Target.URL}
 	if input.Target.Type == "minio_asset" {
 		parsedID, err := parseID("ast", input.Target.AssetID)
@@ -176,10 +169,9 @@ var assetID *uuid.UUID
 		}
 		if err != nil {
 			return CreateResponse{}, err
- workspaceID != actor.WorkspaceID) {
-			return CreateResponse{}, problem(404, "asset_not_found", "素材不存在或无权访问")
 		}
-		if actor.BusinessID != "" && assetBusin
+		if actor.BusinessID != "" && assetBusinessID != actor.BusinessID {
+			return CreateResponse{}, problem(404, "asset_not_found", "素材不存在或无权访问")
 		}
 		if !allowed || (actor.Role != "admin" && workspaceID != actor.WorkspaceID) {
 			return CreateResponse{}, problem(404, "asset_not_found", "素材不存在或无权访问")
@@ -214,14 +206,18 @@ var assetID *uuid.UUID
 		var used int
 		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM short_links WHERE created_by=$1 AND target_type='minio_asset'`, actor.UserID).Scan(&used); err != nil {
 			return CreateResponse{}, err
-CreateResponse{}, problem(409, "minio_asset_link_quota_exceeded", "素材短链创建额度已用尽")
-		}
-	}
-	if actor.APIKeyID != nil {
-		result, err := tx.ExecContext(ctx, `UPDATE api_keys SET created_links_used=created_links_used+1,updated_at=updated_at WHERE api_key_id=$1 AND status='active' AND (expires_at IS NULL OR expires_at>now()
 		}
 		if used >= assetLinkQuota {
 			return CreateResponse{}, problem(409, "minio_asset_link_quota_exceeded", "素材短链创建额度已用尽")
+		}
+	}
+	if actor.APIKeyID != nil {
+		result, err := tx.ExecContext(ctx, `UPDATE api_keys SET created_links_used=created_links_used+1,updated_at=updated_at WHERE api_key_id=$1 AND status='active' AND (expires_at IS NULL OR expires_at>now()) AND (max_created_links IS NULL OR created_links_used < max_created_links)`, *actor.APIKeyID)
+		if err != nil {
+			return CreateResponse{}, err
+		}
+		if rows, _ := result.RowsAffected(); rows != 1 {
+			return CreateResponse{}, problem(429, "api_key_link_quota_exceeded", "API Key 短链创建额度已用尽")
 		}
 	}
 
@@ -233,10 +229,10 @@ CreateResponse{}, problem(409, "minio_asset_link_quota_exceeded", "素材短链�
 	}
 	linkID := uuid.New()
 	tagsJSON, _ := json.Marshal(tags)
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO short_links (link_id,workspace_id,business_id,title,tags,target_type,target_url,asset_id,expires_at,max_visits,allowed_ip_cidrs,require_password,password_hash,wrong_password_policy,status,template_id,template_version,created_by)
 		VALUES ($1,$2,NULLIF($3,''),$4,$5::jsonb,$6,NULLIF($7,''),$8,$9,$10,$11::cidr[],$12,$13,$14::jsonb,'enabled',$15,$16,$17)`,
 		linkID, workspaceID, assetBusinessID, title, string(tagsJSON), input.Target.Type, input.Target.URL, assetID, input.ExpiresAt, rules.MaxVisits,
-		linkID, workspaceID, title, string(tagsJSON), input.Target.Type, input.Target.URL, assetID, input.ExpiresAt, rules.MaxVisits,
 		cidrArray(rules.AllowedIPCIDRs), rules.RequirePassword, passwordHash, nullableJSON(policyJSON), nullableTemplateID(templateRef), nullableTemplateVersion(templateRef), actor.UserID)
 	if err != nil {
 		return CreateResponse{}, fmt.Errorf("创建短链记录失败: %w", err)
@@ -254,8 +250,8 @@ CreateResponse{}, problem(409, "minio_asset_link_quota_exceeded", "素材短链�
 	}
 	if err := tx.Commit(); err != nil {
 		return CreateResponse{}, err
+	}
 	return CreateResponse{LinkID: publicID("link", linkID), BusinessID: assetBusinessID, Title: title, Tags: tags, Code: code, URL: s.linkURL(code), Target: target, ExpiresAt: input.ExpiresAt, Rules: rules, RuleTemplate: templateRef}, nil
-	return CreateResponse{LinkID: publicID("link", linkID), Title: title, Tags: tags, Code: code, URL: s.linkURL(code), Target: target, ExpiresAt: input.ExpiresAt, Rules: rules, RuleTemplate: templateRef}, nil
 }
 
 func (s *Service) List(ctx context.Context, actor Actor, page, pageSize int, query map[string]string) (Page, error) {
@@ -277,9 +273,9 @@ func (s *Service) List(ctx context.Context, actor Actor, page, pageSize int, que
 			return Page{}, problem(422, "invalid_workspace_id", "工作空间参数无效")
 		}
 		add("sl.workspace_id=$%d", id)
-: "sl.status", "targetType": "sl.target_type", "code": "sc.code"} {
-		if value := query[key]; value != "" {
-			if (key == "status" && value != "enabled" && value 
+	}
+	if actor.BusinessID != "" {
+		add("sl.business_id=$%d", actor.BusinessID)
 	}
 	for key, column := range map[string]string{"status": "sl.status", "targetType": "sl.target_type", "code": "sc.code"} {
 		if value := query[key]; value != "" {
@@ -406,8 +402,8 @@ func (s *Service) Get(ctx context.Context, actor Actor, rawID string) (LinkDTO, 
 	}
 	if err != nil {
 		return LinkDTO{}, err
+	}
 	if !linkInScope(actor, r) {
-	if actor.Role != "admin" && r.WorkspaceID != actor.WorkspaceID {
 		return LinkDTO{}, problem(404, "link_not_found", "短链不存在或无权访问")
 	}
 	return s.dto(r), nil
@@ -437,8 +433,8 @@ func (s *Service) UpdateMetadata(ctx context.Context, actor Actor, rawID string,
 	}
 	if err != nil {
 		return LinkDTO{}, err
+	}
 	if !linkInScope(actor, r) {
-	if actor.Role != "admin" && r.WorkspaceID != actor.WorkspaceID {
 		return LinkDTO{}, problem(404, "link_not_found", "短链不存在或无权访问")
 	}
 	tagsJSON, _ := json.Marshal(tags)
@@ -478,8 +474,8 @@ func (s *Service) UpdateRules(ctx context.Context, actor Actor, rawID string, in
 	}
 	if err != nil {
 		return LinkDTO{}, err
+	}
 	if !linkInScope(actor, r) {
-	if actor.Role != "admin" && r.WorkspaceID != actor.WorkspaceID {
 		return LinkDTO{}, problem(404, "link_not_found", "短链不存在或无权访问")
 	}
 	expiresAt := r.ExpiresAt
@@ -637,8 +633,8 @@ func (s *Service) Renew(ctx context.Context, actor Actor, rawID string, input Re
 	}
 	if err != nil {
 		return nil, err
+	}
 	if !linkInScope(actor, r) {
-	if actor.Role != "admin" && r.WorkspaceID != actor.WorkspaceID {
 		return nil, problem(404, "link_not_found", "短链不存在或无权访问")
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE short_links SET expires_at=$2,updated_at=now() WHERE link_id=$1`, id, input.ExpiresAt); err != nil {
@@ -691,8 +687,8 @@ func (s *Service) Rotate(ctx context.Context, actor Actor, rawID string, input R
 	}
 	if err != nil {
 		return nil, err
+	}
 	if !linkInScope(actor, r) {
-	if actor.Role != "admin" && r.WorkspaceID != actor.WorkspaceID {
 		return nil, problem(404, "link_not_found", "短链不存在或无权访问")
 	}
 	code, err := s.rotate(ctx, tx, id, custom, input.Strategy == "generated")
@@ -727,8 +723,8 @@ func (s *Service) SetStatus(ctx context.Context, actor Actor, rawID, status stri
 	}
 	if err != nil {
 		return nil, err
+	}
 	if !linkInScope(actor, r) {
-	if actor.Role != "admin" && r.WorkspaceID != actor.WorkspaceID {
 		return nil, problem(404, "link_not_found", "短链不存在或无权访问")
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE short_links SET status=$2,updated_at=now() WHERE link_id=$1`, id, status); err != nil {
@@ -765,8 +761,8 @@ func (s *Service) ResetVisits(ctx context.Context, actor Actor, rawID string, me
 	}
 	if err != nil {
 		return nil, err
+	}
 	if !linkInScope(actor, r) {
-	if actor.Role != "admin" && r.WorkspaceID != actor.WorkspaceID {
 		return nil, problem(404, "link_not_found", "短链不存在或无权访问")
 	}
 	now := time.Now().UTC()
@@ -905,8 +901,8 @@ func (s *Service) loadLink(ctx context.Context, q interface {
 		suffix = " FOR UPDATE OF sl"
 	}
 	var r linkRecord
+	var tagsJSON []byte
 	err := q.QueryRowContext(ctx, `SELECT sl.link_id,sl.workspace_id,COALESCE(sl.business_id,a.business_id,''),sl.target_type,sl.target_url,sl.asset_id,a.size_bytes,a.bucket,a.object_key,sl.expires_at,sl.max_visits,sl.visits_used,sl.allowed_ip_cidrs::text,sl.require_password,sl.password_hash,sl.wrong_password_policy,sl.status,sl.template_id,sl.template_version,sc.code,sc.status,sl.created_at,sl.updated_at,sl.title,sl.tags::text FROM short_links sl LEFT JOIN assets a ON a.asset_id=sl.asset_id LEFT JOIN short_link_codes sc ON sc.link_id=sl.link_id AND sc.status='active' WHERE sl.link_id=$1`+suffix, id).Scan(&r.ID, &r.WorkspaceID, &r.BusinessID, &r.TargetType, &r.TargetURL, &r.AssetID, &r.AssetSize, &r.Bucket, &r.ObjectKey, &r.ExpiresAt, &r.MaxVisits, &r.VisitsUsed, &r.IPCIDRs, &r.RequirePassword, &r.PasswordHash, &r.PolicyJSON, &r.Status, &r.TemplateID, &r.TemplateVersion, &r.Code, &r.CodeStatus, &r.CreatedAt, &r.UpdatedAt, &r.Title, &tagsJSON)
-	err := q.QueryRowContext(ctx, `SELECT sl.link_id,sl.workspace_id,sl.target_type,sl.target_url,sl.asset_id,a.size_bytes,a.bucket,a.object_key,sl.expires_at,sl.max_visits,sl.visits_used,sl.allowed_ip_cidrs::text,sl.require_password,sl.password_hash,sl.wrong_password_policy,sl.status,sl.template_id,sl.template_version,sc.code,sc.status,sl.created_at,sl.updated_at,sl.title,sl.tags::text FROM short_links sl LEFT JOIN assets a ON a.asset_id=sl.asset_id LEFT JOIN short_link_codes sc ON sc.link_id=sl.link_id AND sc.status='active' WHERE sl.link_id=$1`+suffix, id).Scan(&r.ID, &r.WorkspaceID, &r.TargetType, &r.TargetURL, &r.AssetID, &r.AssetSize, &r.Bucket, &r.ObjectKey, &r.ExpiresAt, &r.MaxVisits, &r.VisitsUsed, &r.IPCIDRs, &r.RequirePassword, &r.PasswordHash, &r.PolicyJSON, &r.Status, &r.TemplateID, &r.TemplateVersion, &r.Code, &r.CodeStatus, &r.CreatedAt, &r.UpdatedAt, &r.Title, &tagsJSON)
 	if err == nil {
 		r.Tags = []string{}
 		err = json.Unmarshal(tagsJSON, &r.Tags)
@@ -948,6 +944,7 @@ func (s *Service) dto(r linkRecord) LinkDTO {
 	code := ""
 	if r.Code.Valid {
 		code = r.Code.String
+	}
 	return LinkDTO{LinkID: publicID("link", r.ID), BusinessID: r.BusinessID, Title: r.Title, Tags: r.Tags, Code: code, URL: s.linkURL(code), Target: target, Status: r.Status, Availability: availability(r), Rules: rules, ExpiresAt: expires, VisitsUsed: r.VisitsUsed, RuleTemplate: ref, CreatedAt: r.CreatedAt.UTC(), UpdatedAt: r.UpdatedAt.UTC()}
 }
 
@@ -956,7 +953,6 @@ func linkInScope(actor Actor, record linkRecord) bool {
 		return false
 	}
 	return actor.BusinessID == "" || record.BusinessID == actor.BusinessID
-	return LinkDTO{LinkID: publicID("link", r.ID), Title: r.Title, Tags: r.Tags, Code: code, URL: s.linkURL(code), Target: target, Status: r.Status, Availability: availability(r), Rules: rules, ExpiresAt: expires, VisitsUsed: r.VisitsUsed, RuleTemplate: ref, CreatedAt: r.CreatedAt.UTC(), UpdatedAt: r.UpdatedAt.UTC()}
 }
 
 func (s *Service) Access(ctx context.Context, rawCode string, meta RequestMeta, password string, submit bool) (PublicResult, error) {
@@ -1357,16 +1353,23 @@ func problem(status int, code, message string) error {
 func audit(ctx context.Context, tx *sql.Tx, actor, workspace uuid.UUID, action, resourceType, resourceID string, meta RequestMeta, details ...any) error {
 	// 1. 只保存操作需要的白名单元数据；调用方禁止传入口令、凭据或完整敏感 URL。
 	raw := []byte(`{}`)
+	if len(details) > 0 && details[0] != nil {
 		payload := details[0]
 		if meta.AuditDetails != nil {
-			if values, ok := payload.(map[string]any); ok {
-				for key, value := range meta.AuditDetails {
-					values[key] = value
-				}
+			encoded, err := json.Marshal(payload)
+			if err != nil {
+				return err
 			}
+			values := map[string]any{}
+			if err := json.Unmarshal(encoded, &values); err != nil {
+				return err
+			}
+			for key, value := range meta.AuditDetails {
+				values[key] = value
+			}
+			payload = values
 		}
 		encoded, err := json.Marshal(payload)
-		encoded, err := json.Marshal(details[0])
 		if err != nil {
 			return err
 		}

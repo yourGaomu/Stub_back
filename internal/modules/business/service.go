@@ -327,10 +327,8 @@ func (s *Service) auditTx(ctx context.Context, tx *sql.Tx, actor uuid.UUID, work
 	if len(details) > 0 && details[0] != nil {
 		payload := details[0]
 		if meta.AuditDetails != nil {
-			if values, ok := payload.(map[string]any); ok {
-				for key, value := range meta.AuditDetails {
-					values[key] = value
-				}
+			for key, value := range meta.AuditDetails {
+				payload[key] = value
 			}
 		}
 		encoded, err := json.Marshal(payload)
