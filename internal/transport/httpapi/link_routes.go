@@ -81,6 +81,7 @@ func registerLinkRoutes(router *gin.Engine, deps Dependencies) {
 	service := deps.Links
 	api := router.Group("/api/v1")
 	api.Use(authenticate(deps.Auth))
+	api.Use(requireAPIKeyBusinessAccess(deps.DB))
 	api.POST("/links", requireCreateLinkPermission(deps.DB), func(c *gin.Context) {
 		var input links.CreateRequest
 		if !decodeJSON(c, &input) {
@@ -195,18 +196,19 @@ func linkStatusHandler(service *links.Service, status string) gin.HandlerFunc {
 func linkActor(c *gin.Context) links.Actor {
 	identity := currentAuth(c)
 	workspaceID, _ := parsePublicID("ws", identity.User.DefaultWorkspaceID)
-	return links.Actor{UserID: identity.User.ID, WorkspaceID: workspaceID, Role: identity.User.Role}
+	return links.Actor{UserID: identity.User.ID, WorkspaceID: workspaceID, Role: identity.User.Role, BusinessID: apiKeyBusinessID(c), APIKeyID: apiKeyID(c)}
 }
 
 func linkMeta(c *gin.Context) links.RequestMeta {
-	return links.RequestMeta{SourceIP: c.ClientIP(), UserAgent: truncateLogValue(c.Request.UserAgent(), 1024), RequestID: requestID(c)}
+	return links.RequestMeta{SourceIP: c.ClientIP(), UserAgent: truncateLogValue(c.Request.UserAgent(), 1024), RequestID: requestID(c), AuditDetails: apiKeyAuditDetails(c)}
 }
 
 func publicLinkHandler(c *gin.Context, service *links.Service, submit bool) {
 	// 1. 访问入口只接受服务端解析的短码与来源信息，不读任何目标地址参数。
 	c.Header("Cache-Control", "no-store")
 	c.Header("X-Content-Type-Options", "nosniff")
-	c.Header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+	// 1. 口令表单提交可能收到跨域 HTTPS 目标的 302；允许本站和 HTTPS，仍禁止明文 HTTP。
+	c.Header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https:; base-uri 'none'; frame-ancestors 'none'")
 	password := ""
 	if submit {
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 4096)

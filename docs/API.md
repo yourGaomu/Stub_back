@@ -1,6 +1,6 @@
 # HTTP API
 
-本文描述当前 Go 服务已注册的 HTTP 接口。所有管理 API 使用 `/api/v1` 前缀；除邮件验证码、注册、登录、密码重置与公开短链入口外，均使用 `Authorization: Bearer <accessToken>`。Token 最长 7 天，服务端每次请求实时检查会话和当前权限。
+本文描述当前 Go 服务已注册的 HTTP 接口。所有管理 API 使用 `/api/v1` 前缀；除邮件验证码、注册、登录、密码重置与公开短链入口外，均使用人类 `Authorization: Bearer <accessToken>` 或机器 `X-API-Key: stub_sk_...`。机器 Key 也可放在 `Authorization: Bearer stub_sk_...` 中。人类 Token 最长 7 天，API Key 的状态、有效期、IP、频率、scope、业务授权和累计额度由服务端实时检查。
 
 成功列表统一返回 `{ "items": [], "pagination": { "page": 1, "pageSize": 20, "total": 0 } }`。错误统一返回 `{ "error": { "code": "...", "message": "...", "requestId": "..." } }`。时间为 RFC 3339 UTC；公开资源 ID 使用 `usr_`、`link_`、`tpl_`、`ast_` 等前缀。
 
@@ -36,7 +36,7 @@
 | `GET /admin/users` | 搜索用户及用量 | `query`, `role`, 分页 | 分页用户 DTO |
 | `GET /admin/users/{userId}` | 查询用户详情 | 路径 `userId` | `200`: 用户 DTO |
 | `GET /admin/users/{userId}/quotas` | 查询用户额度 | 路径 `userId` | `200`: 文件、存储及短链额度 |
-| `PATCH /admin/users/{userId}/quotas` | 调整用户额度 | 可选 `maxSingleFileBytes`, `storageQuotaBytes`, `urlLinkQuota`, `minioAssetLinkQuota` | `200`: 最新额度与用量 |
+| `PATCH /admin/users/{userId}/quotas` | 调整用户额度 | 可选 `maxSingleFileBytes`, `storageQuotaBytes`, `apiKeyQuota`, `urlLinkQuota`, `minioAssetLinkQuota` | `200`: 最新额度与用量 |
 | `GET /admin/permissions/catalog` | 查询服务端权限目录 | 无 | `200`: `{items}` |
 | `GET /admin/users/{userId}/permissions` | 查询用户当前权限 | 路径 `userId` | `200`: 权限状态 DTO |
 | `PUT /admin/users/{userId}/permissions/{permissionCode}` | 授予权限 | 路径参数 | `200`: 新权限状态 |
@@ -49,6 +49,25 @@
 | `PUT /admin/users/{userId}/businesses/{businessId}` | 授予业务访问权 | 路径参数 | `200`: 授权 DTO |
 | `DELETE /admin/users/{userId}/businesses/{businessId}` | 撤销业务访问权 | 路径参数 | `204` |
 | `GET /admin/security-events/unknown-short-codes` | 查看未知短码聚合事件 | `from`, `to`, `sourceIp`, `rateLimited`, 分页 | 分页安全事件 DTO |
+
+## API Key（机器调用）
+
+每把 API Key 必须绑定一个 `businessId`，客户端调用业务接口时不再传业务标识，服务端从 Key 反查并注入。普通用户默认最多 20 把未吊销 Key，实际上限由管理员配置 `apiKeyQuota`。创建、编辑、启停和吊销本人 Key 需要 `api_keys.manage` 和人类 Session Token；明文 `secretKey` 只在创建响应中出现一次。
+
+| 方法与路径 | 作用 | 请求/权限 | 成功响应 |
+| --- | --- | --- | --- |
+| `POST /api-keys` | 创建机器调用 Key | 人类 Bearer；`name`, `businessId`, `scopes`, 可选 IP、频率、累计额度、`allowAccountAccess` | `201`: Key DTO 与一次性 `secretKey` |
+| `GET /api-keys` | 查询本人 Key | 人类 Bearer；可选 `status`, 分页 | `200`: 分页 Key DTO，不含明文 |
+| `PATCH /api-keys/{apiKeyId}` | 修改规则、scope、业务、额度和账号只读开关 | 人类 Bearer | `200`: 更新后的 Key DTO |
+| `POST /api-keys/{apiKeyId}/disable` | 临时停用 | 人类 Bearer | `200`: Key DTO |
+| `POST /api-keys/{apiKeyId}/enable` | 恢复启用 | 人类 Bearer | `200`: Key DTO |
+| `POST /api-keys/{apiKeyId}/revoke` | 永久吊销，不可恢复 | 人类 Bearer | `200`: Key DTO |
+| `GET /admin/users/{userId}/api-keys` | 管理员查询用户 Key | 管理员人类 Bearer | `200`: 分页 Key DTO |
+| `POST /admin/api-keys/{apiKeyId}/revoke` | 管理员强制吊销 | 管理员人类 Bearer | `204` |
+
+API Key 只能授予短链、素材和模板的 11 项业务 scope；禁止调用认证、会话、邀请码、管理员、日志和 API Key 管理接口。`/me`、`/me/permissions`、`/me/usage`、`/me/businesses` 仅在 `allowAccountAccess=true` 时可调用。Key 的有效权限是 Key scope 与用户当前权限的实时交集。
+
+API Key 相关错误还包括：`api_key_owner_permission_denied`（所属用户的 API Key 管理权限已被撤销）、`api_key_account_access_denied`（未开启账号只读接口）、`api_key_business_denied`（请求业务与 Key 绑定业务不一致）、`api_key_limit_below_usage`（新额度低于已用累计值）、`invalid_api_key_scope`（scope 不在白名单或重复）、`invalid_api_key_ip`（来源 IP/CIDR 无效）、`invalid_api_key_expiration`（到期时间无效）和 `api_key_already_revoked`（已吊销且不可恢复）。上传和建链额度分别超限时返回 `429 api_key_upload_quota_exceeded`、`429 api_key_link_quota_exceeded`。
 
 ## 短链
 
@@ -98,8 +117,8 @@
 | 方法与路径 | 作用与权限 | 请求 | 成功响应 |
 | --- | --- | --- | --- |
 | `GET /me/businesses` | 查询当前可访问业务 | 无 | `200`: `{items}` |
-| `POST /assets` | 上传单个素材；`assets.upload` 且必须获准访问 `businessId` | multipart: `businessId`, `path`, `file` | `201`: `assetId`, 文件元数据、校验值、创建时间 |
-| `GET /assets` | 查询素材；`assets.read` | `businessId`, `includeDeleted`, `keyword`, 管理员可传 `workspaceId` / `ownerUserId`, 分页 | 分页素材 DTO |
+| `POST /assets` | 上传单个素材；`assets.upload` 且必须获准访问业务 | 人类会话 multipart 必传 `businessId`；API Key 不传该字段，由服务端注入 Key 绑定业务；另传 `path`, `file` | `201`: `assetId`, 文件元数据、校验值、创建时间 |
+| `GET /assets` | 查询素材；`assets.read` | 人类会话可传 `businessId`；API Key 自动限定为绑定业务；另传 `includeDeleted`, `keyword`, 管理员可传 `workspaceId` / `ownerUserId`, 分页 | 分页素材 DTO |
 | `GET /assets/{assetId}` | 查询素材元数据；`assets.read` | 路径 ID | `200`: 素材 DTO，不含桶名/对象 key |
 | `GET /assets/{assetId}/content` | 签发 15 分钟预签名访问 URL；`assets.read` | 路径 ID | `302 Location` 指向对象公网域名 |
 | `DELETE /assets/{assetId}` | 软删除并进入 7 天恢复期；`assets.delete` | 路径 ID | `200`: `deletedAt`, `purgeAfter`, `status` |

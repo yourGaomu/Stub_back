@@ -15,7 +15,11 @@ func registerBusinessRoutes(router *gin.Engine, deps Dependencies) {
 	api.Use(authenticate(deps.Auth))
 	api.GET("/me/businesses", func(c *gin.Context) {
 		identity := currentAuth(c)
-		items, err := service.Me(c.Request.Context(), business.Actor{UserID: identity.User.ID, Role: identity.User.Role})
+		if identity.APIKey != nil && !identity.APIKey.AllowAccountAccess {
+			writeError(c, http.StatusForbidden, "api_key_account_access_denied", "该 API Key 未开启账号信息访问能力")
+			return
+		}
+		items, err := service.Me(c.Request.Context(), business.Actor{UserID: identity.User.ID, Role: identity.User.Role, BusinessID: apiKeyBusinessID(c)})
 		if err != nil {
 			writeServiceError(c, err)
 			return
@@ -107,5 +111,5 @@ func businessUserID(c *gin.Context) (uuid.UUID, bool) {
 }
 
 func businessMeta(c *gin.Context) business.Meta {
-	return business.Meta{SourceIP: c.ClientIP(), UserAgent: truncateLogValue(c.Request.UserAgent(), 1024), RequestID: requestID(c)}
+	return business.Meta{SourceIP: c.ClientIP(), UserAgent: truncateLogValue(c.Request.UserAgent(), 1024), RequestID: requestID(c), AuditDetails: apiKeyAuditDetails(c)}
 }

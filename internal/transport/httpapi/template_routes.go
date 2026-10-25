@@ -118,5 +118,5 @@ func templateActor(c *gin.Context) templates.Actor {
 }
 
 func templateMeta(c *gin.Context) templates.Meta {
-	return templates.Meta{SourceIP: c.ClientIP(), UserAgent: c.Request.UserAgent(), RequestID: requestID(c)}
+	return templates.Meta{SourceIP: c.ClientIP(), UserAgent: c.Request.UserAgent(), RequestID: requestID(c), AuditDetails: apiKeyAuditDetails(c)}
 }
