@@ -165,7 +165,9 @@ func (s *Service) Upload(ctx context.Context, actor Actor, input UploadInput, me
 		}
 		if rows, _ := result.RowsAffected(); rows != 1 {
 			temp.Close()
-		
+			return AssetDTO{}, problem(429, "api_key_upload_quota_exceeded", "API Key 累计上传额度已用尽")
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE users SET storage_used_bytes=storage_used_bytes+$2,updated_at=now() WHERE user_id=$1`, actor.UserID, written); err != nil {
 		temp.Close()
 		return AssetDTO{}, err
@@ -632,23 +634,23 @@ func problem(status int, code, message string) error {
 	return &Problem{Status: status, Code: code, Message: message}
 }
 func audit(ctx context.Context, tx *sql.Tx, actor, workspace uuid.UUID, event, target string, meta Meta, details any) error {
-	var raw string = "{}"
+	raw := "{}"
 	if details != nil {
 		payload := details
 		if meta.AuditDetails != nil {
 			encoded, err := json.Marshal(details)
-			if err != nil { return err }
-			values := map[string]any{}
 			if err != nil {
 				return err
 			}
-			for key, value := range meta.AuditDetails { values[key] = value }
+			values := map[string]any{}
 			if err := json.Unmarshal(encoded, &values); err != nil {
 				return err
 			}
 			for key, value := range meta.AuditDetails {
 				values[key] = value
 			}
+			payload = values
+		}
 		encoded, err := json.Marshal(payload)
 		if err != nil {
 			return err
