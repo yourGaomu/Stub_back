@@ -71,7 +71,8 @@ type VersionListItemDTO struct {
 }
 
 type Meta struct {
-	SourceIP  string
-	UserAgent string
-	RequestID string
+	SourceIP     string
+	UserAgent    string
+	RequestID    string
+	AuditDetails map[string]any
 }

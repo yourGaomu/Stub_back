@@ -50,9 +50,9 @@ func NewRouter(deps Dependencies) (*gin.Engine, error) {
 	}
 	router.Use(gin.Recovery(), requestContext(deps.Logger))
 	router.Use(cors.New(cors.Config{
-		AllowOrigins:     deps.Config.CORSAllowedOrigins,
-		AllowMethods:     []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Authorization", "Content-Type", "X-Client-App", "X-Request-ID"},
+		AllowOrigins:     append(deps.Config.CORSAllowedOrigins, "https://localhost:5174", "http://localhost"),
+		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowHeaders:     []string{"Authorization", "Content-Type", "X-API-Key", "X-Client-App", "X-Request-ID"},
 		ExposeHeaders:    []string{"X-Request-ID"},
 		AllowCredentials: true,
 	}))
@@ -80,6 +80,7 @@ func NewRouter(deps Dependencies) (*gin.Engine, error) {
 	})
 	// 4. 按业务域注册路由；领域服务由 app 组合根构造并注入。
 	registerAuthRoutes(router, deps.Auth, deps.DB)
+	registerAPIKeyRoutes(router, deps.Auth, deps.DB)
 	registerLinkRoutes(router, deps)
 	registerTemplateRoutes(router, deps)
 	registerBusinessRoutes(router, deps)

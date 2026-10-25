@@ -19,11 +19,14 @@ type Actor struct {
 	UserID      uuid.UUID
 	WorkspaceID uuid.UUID
 	Role        string
+	BusinessID  string
+	APIKeyID    *uuid.UUID
 }
 type Meta struct {
-	SourceIP  string
-	UserAgent string
-	RequestID string
+	SourceIP     string
+	UserAgent    string
+	RequestID    string
+	AuditDetails map[string]any
 }
 
 type UploadInput struct {

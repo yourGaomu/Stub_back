@@ -26,13 +26,15 @@ type Problem struct {
 func (p *Problem) Error() string { return p.Message }
 
 type Actor struct {
-	UserID uuid.UUID
-	Role   string
+	UserID     uuid.UUID
+	Role       string
+	BusinessID string
 }
 type Meta struct {
-	SourceIP  string
-	UserAgent string
-	RequestID string
+	SourceIP     string
+	UserAgent    string
+	RequestID    string
+	AuditDetails map[string]any
 }
 
 type BusinessDTO struct {
@@ -85,8 +87,8 @@ func NewService(db *sql.DB, store *objectstore.Store) *Service { return &Service
 
 func (s *Service) Me(ctx context.Context, actor Actor) ([]map[string]string, error) {
 	// 1. 当前用户只能获得管理员授予的已启用业务；管理员可访问全部业务。
-	query := `SELECT bi.business_id,bi.display_name FROM business_integrations bi WHERE bi.status='active' AND EXISTS(SELECT 1 FROM users u WHERE u.user_id=$1 AND u.role='admin') OR (bi.status='active' AND EXISTS(SELECT 1 FROM user_business_access uba WHERE uba.user_id=$1 AND uba.business_id=bi.business_id AND uba.revoked_at IS NULL)) ORDER BY bi.business_id`
-	rows, err := s.db.QueryContext(ctx, query, actor.UserID)
+	query := `SELECT bi.business_id,bi.display_name FROM business_integrations bi WHERE bi.status='active' AND ($2='' OR bi.business_id=$2) AND (EXISTS(SELECT 1 FROM users u WHERE u.user_id=$1 AND u.role='admin') OR EXISTS(SELECT 1 FROM user_business_access uba WHERE uba.user_id=$1 AND uba.business_id=bi.business_id AND uba.revoked_at IS NULL)) ORDER BY bi.business_id`
+	rows, err := s.db.QueryContext(ctx, query, actor.UserID, actor.BusinessID)
 	if err != nil {
 		return nil, err
 	}
@@ -323,7 +325,15 @@ func (s *Service) auditTx(ctx context.Context, tx *sql.Tx, actor uuid.UUID, work
 	// 1. 审计详情只保存业务标识与变更摘要，不保存 MinIO 凭据或对象 URL。
 	raw := []byte(`{}`)
 	if len(details) > 0 && details[0] != nil {
-		encoded, err := json.Marshal(details[0])
+		payload := details[0]
+		if meta.AuditDetails != nil {
+			if values, ok := payload.(map[string]any); ok {
+				for key, value := range meta.AuditDetails {
+					values[key] = value
+				}
+			}
+		}
+		encoded, err := json.Marshal(payload)
 		if err != nil {
 			return err
 		}

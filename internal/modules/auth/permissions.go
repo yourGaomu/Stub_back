@@ -11,7 +11,7 @@ import (
 var defaultPermissionCodes = []string{
 	"links.read", "links.create_url", "links.create_asset", "links.manage", "links.reset_visits",
 	"assets.read", "assets.upload", "assets.delete", "assets.restore",
-	"templates.read_use", "templates.manage", "invites.create_revoke", "logs.read_own",
+	"templates.read_use", "templates.manage", "invites.create_revoke", "logs.read_own", "api_keys.manage",
 }
 
 func createDefaultUserPermissions(ctx context.Context, tx *sql.Tx, userID uuid.UUID) error {

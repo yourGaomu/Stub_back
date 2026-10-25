@@ -63,6 +63,7 @@ type AdminUserItem struct {
 	DefaultWorkspaceID  string    `json:"defaultWorkspaceId"`
 	StorageQuotaBytes   int64     `json:"storageQuotaBytes"`
 	StorageUsedBytes    int64     `json:"storageUsedBytes"`
+	APIKeyQuota         int       `json:"apiKeyQuota"`
 	URLLinkQuota        int       `json:"urlLinkQuota"`
 	URLLinkUsed         int64     `json:"urlLinkUsed"`
 	AssetLinkQuota      int       `json:"minioAssetLinkQuota"`
@@ -84,6 +85,8 @@ type Quotas struct {
 	MaxSingleFileBytes  int64 `json:"maxSingleFileBytes"`
 	StorageQuotaBytes   int64 `json:"storageQuotaBytes"`
 	StorageUsedBytes    int64 `json:"storageUsedBytes"`
+	APIKeyQuota         int   `json:"apiKeyQuota"`
+	APIKeyUsed          int64 `json:"apiKeyUsed"`
 	URLLinkQuota        *int  `json:"urlLinkQuota"`
 	URLLinkUsed         int64 `json:"urlLinkUsed"`
 	MinioAssetLinkQuota *int  `json:"minioAssetLinkQuota"`
@@ -93,6 +96,7 @@ type Quotas struct {
 type QuotaPatch struct {
 	MaxSingleFileBytes  *int64 `json:"maxSingleFileBytes,omitempty"`
 	StorageQuotaBytes   *int64 `json:"storageQuotaBytes,omitempty"`
+	APIKeyQuota         *int   `json:"apiKeyQuota,omitempty"`
 	URLLinkQuota        *int   `json:"urlLinkQuota,omitempty"`
 	MinioAssetLinkQuota *int   `json:"minioAssetLinkQuota,omitempty"`
 }
@@ -117,6 +121,7 @@ var permissionCatalog = []PermissionCatalogItem{
 	{Code: "templates.manage", Name: "管理模板", Description: "创建及维护本人工作空间中的规则模板"},
 	{Code: "invites.create_revoke", Name: "管理邀请码", Description: "创建普通用户邀请码及撤销本人未使用的邀请码"},
 	{Code: "logs.read_own", Name: "查看本人日志", Description: "查询本人操作或本人资源的访问与操作日志"},
+	{Code: "api_keys.manage", Name: "管理 API Key", Description: "创建、查看、编辑、启停和吊销本人的机器调用凭证"},
 }
 
 func (s *Service) MyPermissions(ctx context.Context, userID uuid.UUID, role string) (PermissionsResponse, error) {
@@ -326,7 +331,7 @@ func (s *Service) AdminUsers(ctx context.Context, query, role string, page, page
 		return AdminUsersPage{}, err
 	}
 	args = append(args, pageSize, (page-1)*pageSize)
-	rows, err := s.db.QueryContext(ctx, `SELECT u.user_id,u.email,u.role,u.invited_by_user_id,u.email_verified_at,u.created_at,u.default_workspace_id,u.storage_quota_bytes,u.storage_used_bytes,u.url_link_quota,u.minio_asset_link_quota,(SELECT count(*) FROM short_links l WHERE l.created_by=u.user_id AND l.target_type='url'),(SELECT count(*) FROM short_links l WHERE l.created_by=u.user_id AND l.target_type='minio_asset'),(SELECT count(*) FROM user_permissions p WHERE p.user_id=u.user_id AND p.granted_at IS NOT NULL AND p.revoked_at IS NULL),(SELECT count(*) FROM user_business_access b WHERE b.user_id=u.user_id AND b.revoked_at IS NULL) FROM users u WHERE `+filter+fmt.Sprintf(" ORDER BY u.created_at DESC LIMIT $%d OFFSET $%d", len(args)-1, len(args)), args...)
+	rows, err := s.db.QueryContext(ctx, `SELECT u.user_id,u.email,u.role,u.invited_by_user_id,u.email_verified_at,u.created_at,u.default_workspace_id,u.storage_quota_bytes,u.storage_used_bytes,u.api_key_quota,u.url_link_quota,u.minio_asset_link_quota,(SELECT count(*) FROM short_links l WHERE l.created_by=u.user_id AND l.target_type='url'),(SELECT count(*) FROM short_links l WHERE l.created_by=u.user_id AND l.target_type='minio_asset'),(SELECT count(*) FROM user_permissions p WHERE p.user_id=u.user_id AND p.granted_at IS NOT NULL AND p.revoked_at IS NULL),(SELECT count(*) FROM user_business_access b WHERE b.user_id=u.user_id AND b.revoked_at IS NULL) FROM users u WHERE `+filter+fmt.Sprintf(" ORDER BY u.created_at DESC LIMIT $%d OFFSET $%d", len(args)-1, len(args)), args...)
 	if err != nil {
 		return AdminUsersPage{}, err
 	}
@@ -336,7 +341,7 @@ func (s *Service) AdminUsers(ctx context.Context, query, role string, page, page
 		var id, workspace uuid.UUID
 		var invited sql.NullString
 		var item AdminUserItem
-		if err := rows.Scan(&id, &item.Email, &item.Role, &invited, &item.EmailVerifiedAt, &item.CreatedAt, &workspace, &item.StorageQuotaBytes, &item.StorageUsedBytes, &item.URLLinkQuota, &item.AssetLinkQuota, &item.URLLinkUsed, &item.AssetLinkUsed, &item.PermissionCount, &item.BusinessAccessCount); err != nil {
+		if err := rows.Scan(&id, &item.Email, &item.Role, &invited, &item.EmailVerifiedAt, &item.CreatedAt, &workspace, &item.StorageQuotaBytes, &item.StorageUsedBytes, &item.APIKeyQuota, &item.URLLinkQuota, &item.AssetLinkQuota, &item.URLLinkUsed, &item.AssetLinkUsed, &item.PermissionCount, &item.BusinessAccessCount); err != nil {
 			return AdminUsersPage{}, err
 		}
 		item.UserID = publicID("usr", id)
@@ -360,7 +365,7 @@ func (s *Service) AdminUser(ctx context.Context, id uuid.UUID) (AdminUserItem, e
 	var item AdminUserItem
 	var invited sql.NullString
 	var workspace uuid.UUID
-	err := s.db.QueryRowContext(ctx, `SELECT u.user_id,u.email,u.role,u.invited_by_user_id,u.email_verified_at,u.created_at,u.default_workspace_id,u.storage_quota_bytes,u.storage_used_bytes,u.url_link_quota,u.minio_asset_link_quota,(SELECT count(*) FROM short_links l WHERE l.created_by=u.user_id AND l.target_type='url'),(SELECT count(*) FROM short_links l WHERE l.created_by=u.user_id AND l.target_type='minio_asset'),(SELECT count(*) FROM user_permissions p WHERE p.user_id=u.user_id AND p.granted_at IS NOT NULL AND p.revoked_at IS NULL),(SELECT count(*) FROM user_business_access b WHERE b.user_id=u.user_id AND b.revoked_at IS NULL) FROM users u WHERE u.user_id=$1`, id).Scan(&id, &item.Email, &item.Role, &invited, &item.EmailVerifiedAt, &item.CreatedAt, &workspace, &item.StorageQuotaBytes, &item.StorageUsedBytes, &item.URLLinkQuota, &item.AssetLinkQuota, &item.URLLinkUsed, &item.AssetLinkUsed, &item.PermissionCount, &item.BusinessAccessCount)
+	err := s.db.QueryRowContext(ctx, `SELECT u.user_id,u.email,u.role,u.invited_by_user_id,u.email_verified_at,u.created_at,u.default_workspace_id,u.storage_quota_bytes,u.storage_used_bytes,u.api_key_quota,u.url_link_quota,u.minio_asset_link_quota,(SELECT count(*) FROM short_links l WHERE l.created_by=u.user_id AND l.target_type='url'),(SELECT count(*) FROM short_links l WHERE l.created_by=u.user_id AND l.target_type='minio_asset'),(SELECT count(*) FROM user_permissions p WHERE p.user_id=u.user_id AND p.granted_at IS NOT NULL AND p.revoked_at IS NULL),(SELECT count(*) FROM user_business_access b WHERE b.user_id=u.user_id AND b.revoked_at IS NULL) FROM users u WHERE u.user_id=$1`, id).Scan(&id, &item.Email, &item.Role, &invited, &item.EmailVerifiedAt, &item.CreatedAt, &workspace, &item.StorageQuotaBytes, &item.StorageUsedBytes, &item.APIKeyQuota, &item.URLLinkQuota, &item.AssetLinkQuota, &item.URLLinkUsed, &item.AssetLinkUsed, &item.PermissionCount, &item.BusinessAccessCount)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AdminUserItem{}, problem(404, "user_not_found", "用户不存在")
 	}
@@ -381,7 +386,7 @@ func (s *Service) AdminUser(ctx context.Context, id uuid.UUID) (AdminUserItem, e
 func (s *Service) UserQuotas(ctx context.Context, id uuid.UUID) (Quotas, error) {
 	var q Quotas
 	var urlQuota, assetQuota int
-	err := s.db.QueryRowContext(ctx, `SELECT max_single_file_bytes,storage_quota_bytes,storage_used_bytes,url_link_quota,minio_asset_link_quota,(SELECT count(*) FROM short_links l WHERE l.created_by=u.user_id AND l.target_type='url'),(SELECT count(*) FROM short_links l WHERE l.created_by=u.user_id AND l.target_type='minio_asset') FROM users u WHERE user_id=$1`, id).Scan(&q.MaxSingleFileBytes, &q.StorageQuotaBytes, &q.StorageUsedBytes, &urlQuota, &assetQuota, &q.URLLinkUsed, &q.MinioAssetLinkUsed)
+	err := s.db.QueryRowContext(ctx, `SELECT max_single_file_bytes,storage_quota_bytes,storage_used_bytes,api_key_quota,(SELECT count(*) FROM api_keys k WHERE k.user_id=u.user_id AND k.status IN ('active','disabled')),url_link_quota,minio_asset_link_quota,(SELECT count(*) FROM short_links l WHERE l.created_by=u.user_id AND l.target_type='url'),(SELECT count(*) FROM short_links l WHERE l.created_by=u.user_id AND l.target_type='minio_asset') FROM users u WHERE user_id=$1`, id).Scan(&q.MaxSingleFileBytes, &q.StorageQuotaBytes, &q.StorageUsedBytes, &q.APIKeyQuota, &q.APIKeyUsed, &urlQuota, &assetQuota, &q.URLLinkUsed, &q.MinioAssetLinkUsed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Quotas{}, problem(404, "user_not_found", "用户不存在")
 	}
@@ -392,10 +397,10 @@ func (s *Service) UserQuotas(ctx context.Context, id uuid.UUID) (Quotas, error) 
 
 func (s *Service) UpdateUserQuotas(ctx context.Context, actorID, targetID uuid.UUID, input QuotaPatch, meta AuditMeta) (Quotas, error) {
 	// 1. 额度独立修改；允许下调到已用量以下，但不删除或停用现有资源。
-	if input.MaxSingleFileBytes == nil && input.StorageQuotaBytes == nil && input.URLLinkQuota == nil && input.MinioAssetLinkQuota == nil {
+	if input.MaxSingleFileBytes == nil && input.StorageQuotaBytes == nil && input.APIKeyQuota == nil && input.URLLinkQuota == nil && input.MinioAssetLinkQuota == nil {
 		return Quotas{}, problem(422, "empty_update", "至少提供一个额度字段")
 	}
-	if (input.MaxSingleFileBytes != nil && *input.MaxSingleFileBytes < 0) || (input.StorageQuotaBytes != nil && *input.StorageQuotaBytes < 0) || (input.URLLinkQuota != nil && *input.URLLinkQuota < 0) || (input.MinioAssetLinkQuota != nil && *input.MinioAssetLinkQuota < 0) {
+	if (input.MaxSingleFileBytes != nil && *input.MaxSingleFileBytes < 0) || (input.StorageQuotaBytes != nil && *input.StorageQuotaBytes < 0) || (input.APIKeyQuota != nil && *input.APIKeyQuota < 0) || (input.URLLinkQuota != nil && *input.URLLinkQuota < 0) || (input.MinioAssetLinkQuota != nil && *input.MinioAssetLinkQuota < 0) {
 		return Quotas{}, problem(422, "invalid_quota", "额度不能为负数")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -405,13 +410,13 @@ func (s *Service) UpdateUserQuotas(ctx context.Context, actorID, targetID uuid.U
 	defer tx.Rollback()
 	var workspace uuid.UUID
 	var previousMaxSingleFileBytes, previousStorageQuotaBytes int64
-	var previousURLLinkQuota, previousAssetLinkQuota int
-	if err := tx.QueryRowContext(ctx, `SELECT default_workspace_id,max_single_file_bytes,storage_quota_bytes,url_link_quota,minio_asset_link_quota FROM users WHERE user_id=$1 FOR UPDATE`, targetID).Scan(&workspace, &previousMaxSingleFileBytes, &previousStorageQuotaBytes, &previousURLLinkQuota, &previousAssetLinkQuota); errors.Is(err, sql.ErrNoRows) {
+	var previousAPIKeyQuota, previousURLLinkQuota, previousAssetLinkQuota int
+	if err := tx.QueryRowContext(ctx, `SELECT default_workspace_id,max_single_file_bytes,storage_quota_bytes,api_key_quota,url_link_quota,minio_asset_link_quota FROM users WHERE user_id=$1 FOR UPDATE`, targetID).Scan(&workspace, &previousMaxSingleFileBytes, &previousStorageQuotaBytes, &previousAPIKeyQuota, &previousURLLinkQuota, &previousAssetLinkQuota); errors.Is(err, sql.ErrNoRows) {
 		return Quotas{}, problem(404, "user_not_found", "用户不存在")
 	} else if err != nil {
 		return Quotas{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE users SET max_single_file_bytes=COALESCE($2,max_single_file_bytes),storage_quota_bytes=COALESCE($3,storage_quota_bytes),url_link_quota=COALESCE($4,url_link_quota),minio_asset_link_quota=COALESCE($5,minio_asset_link_quota),updated_at=now() WHERE user_id=$1`, targetID, input.MaxSingleFileBytes, input.StorageQuotaBytes, input.URLLinkQuota, input.MinioAssetLinkQuota); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE users SET max_single_file_bytes=COALESCE($2,max_single_file_bytes),storage_quota_bytes=COALESCE($3,storage_quota_bytes),api_key_quota=COALESCE($4,api_key_quota),url_link_quota=COALESCE($5,url_link_quota),minio_asset_link_quota=COALESCE($6,minio_asset_link_quota),updated_at=now() WHERE user_id=$1`, targetID, input.MaxSingleFileBytes, input.StorageQuotaBytes, input.APIKeyQuota, input.URLLinkQuota, input.MinioAssetLinkQuota); err != nil {
 		return Quotas{}, err
 	}
 	changes := make(map[string]any)
@@ -420,6 +425,9 @@ func (s *Service) UpdateUserQuotas(ctx context.Context, actorID, targetID uuid.U
 	}
 	if input.StorageQuotaBytes != nil {
 		changes["storageQuotaBytesBefore"], changes["storageQuotaBytesAfter"] = previousStorageQuotaBytes, *input.StorageQuotaBytes
+	}
+	if input.APIKeyQuota != nil {
+		changes["apiKeyQuotaBefore"], changes["apiKeyQuotaAfter"] = previousAPIKeyQuota, *input.APIKeyQuota
 	}
 	if input.URLLinkQuota != nil {
 		changes["urlLinkQuotaBefore"], changes["urlLinkQuotaAfter"] = previousURLLinkQuota, *input.URLLinkQuota

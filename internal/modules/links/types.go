@@ -60,6 +60,7 @@ type TemplateRef struct {
 
 type LinkDTO struct {
 	LinkID       string       `json:"linkId"`
+	BusinessID   string       `json:"businessId,omitempty"`
 	Title        string       `json:"title"`
 	Tags         []string     `json:"tags"`
 	Code         string       `json:"code"`
@@ -84,6 +85,7 @@ type TargetDTO struct {
 
 type CreateResponse struct {
 	LinkID       string       `json:"linkId"`
+	BusinessID   string       `json:"businessId,omitempty"`
 	Title        string       `json:"title"`
 	Tags         []string     `json:"tags"`
 	Code         string       `json:"code"`

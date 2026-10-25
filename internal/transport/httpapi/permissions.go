@@ -15,8 +15,12 @@ import (
 
 func requirePermission(db *sql.DB, permission string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 1. 管理员角色拥有固定权限目录的全部能力，普通用户实时读取权限表。
+		// 1. API Key 必须同时具备 Key scope；用户权限仍从数据库实时读取，二者取交集。
 		identity := currentAuth(c)
+		if identity.APIKey != nil && !identity.APIKey.Scopes[permission] {
+			writeError(c, http.StatusForbidden, "api_key_scope_denied", "API Key 没有执行此操作的权限")
+			return
+		}
 		if identity.User.Role == "admin" {
 			c.Next()
 			return
@@ -35,9 +39,34 @@ func requirePermission(db *sql.DB, permission string) gin.HandlerFunc {
 	}
 }
 
+func requireAPIKeyBusinessAccess(db *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		identity := currentAuth(c)
+		if identity.APIKey == nil {
+			c.Next()
+			return
+		}
+		var allowed bool
+		err := db.QueryRowContext(c.Request.Context(), `SELECT EXISTS(SELECT 1 FROM business_integrations bi WHERE bi.business_id=$1 AND bi.status='active' AND ($2='admin' OR EXISTS(SELECT 1 FROM user_business_access uba WHERE uba.user_id=$3 AND uba.business_id=$1 AND uba.revoked_at IS NULL)))`, identity.APIKey.BusinessID, identity.User.Role, identity.User.ID).Scan(&allowed)
+		if err != nil {
+			writeError(c, http.StatusInternalServerError, "business_access_check_failed", "服务内部错误")
+			return
+		}
+		if !allowed {
+			writeError(c, http.StatusForbidden, "api_key_business_denied", "API Key 绑定的业务已停用或不再授权")
+			return
+		}
+		c.Next()
+	}
+}
+
 func requireAdmin() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 1. 仅使用认证中间件从数据库确认的角色，不接收客户端自报角色。
+		if currentAuth(c).APIKey != nil {
+			writeError(c, http.StatusForbidden, "api_key_forbidden_endpoint", "管理员治理接口必须使用人类登录会话")
+			return
+		}
 		if currentAuth(c).User.Role != "admin" {
 			writeError(c, http.StatusForbidden, "admin_required", "需要管理员权限")
 			return
@@ -49,7 +78,12 @@ func requireAdmin() gin.HandlerFunc {
 func requireCreateLinkPermission(db *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 1. 只读取目标类型来选择权限，随后完整恢复请求体供 DTO Handler 解析。
-		if currentAuth(c).User.Role == "admin" {
+		identity := currentAuth(c)
+		if identity.APIKey != nil && !identity.APIKey.Scopes["links.create_url"] && !identity.APIKey.Scopes["links.create_asset"] {
+			writeError(c, http.StatusForbidden, "api_key_scope_denied", "API Key 没有创建短链的权限")
+			return
+		}
+		if identity.User.Role == "admin" && identity.APIKey == nil {
 			c.Next()
 			return
 		}
@@ -80,6 +114,13 @@ func requireCreateLinkPermission(db *sql.DB) gin.HandlerFunc {
 			permissions = append(permissions, "templates.read_use")
 		}
 		for _, required := range permissions {
+			if identity.APIKey != nil && !identity.APIKey.Scopes[required] {
+				writeError(c, http.StatusForbidden, "api_key_scope_denied", "API Key 没有执行此操作的权限")
+				return
+			}
+			if identity.APIKey != nil && identity.User.Role == "admin" {
+				continue
+			}
 			var enabled bool
 			if err := db.QueryRowContext(c.Request.Context(), `SELECT EXISTS (SELECT 1 FROM user_permissions WHERE user_id=$1 AND permission_code=$2 AND granted_at IS NOT NULL AND revoked_at IS NULL)`, currentAuth(c).User.ID, required).Scan(&enabled); err != nil {
 				writeError(c, http.StatusInternalServerError, "permission_check_failed", "服务内部错误")
@@ -121,6 +162,16 @@ func requireMultipartBusinessAccess(db *sql.DB) gin.HandlerFunc {
 			defer c.Request.MultipartForm.RemoveAll()
 		}
 		businessID := strings.TrimSpace(c.Request.FormValue("businessId"))
+		if keyBusiness := apiKeyBusinessID(c); keyBusiness != "" {
+			if businessID != "" && businessID != keyBusiness {
+				writeError(c, http.StatusForbidden, "api_key_business_denied", "API Key 未授权该业务")
+				return
+			}
+			businessID = keyBusiness
+			if c.Request.MultipartForm != nil {
+				c.Request.MultipartForm.Value["businessId"] = []string{keyBusiness}
+			}
+		}
 		if businessID == "" {
 			writeError(c, http.StatusNotFound, "business_not_found", "业务不存在或无权访问")
 			return

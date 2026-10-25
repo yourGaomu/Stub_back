@@ -46,6 +46,9 @@ func (s *Service) Upload(ctx context.Context, actor Actor, input UploadInput, me
 	if input.File == nil || strings.TrimSpace(input.BusinessID) == "" {
 		return AssetDTO{}, problem(422, "invalid_upload", "businessId、path 和 file 均为必填项")
 	}
+	if actor.BusinessID != "" && strings.TrimSpace(input.BusinessID) != actor.BusinessID {
+		return AssetDTO{}, problem(403, "api_key_business_denied", "API Key 未授权该业务")
+	}
 	logicalPath, err := validateLogicalPath(input.Path)
 	if err != nil {
 		return AssetDTO{}, err
@@ -154,6 +157,15 @@ func (s *Service) Upload(ctx context.Context, actor Actor, input UploadInput, me
 			return AssetDTO{}, problem(404, "business_not_found", "业务不存在、已停用或无权访问")
 		}
 	}
+	if actor.APIKeyID != nil {
+		result, err := tx.ExecContext(ctx, `UPDATE api_keys SET uploaded_bytes_used=uploaded_bytes_used+$2,updated_at=updated_at WHERE api_key_id=$1 AND status='active' AND (expires_at IS NULL OR expires_at>now()) AND (max_upload_bytes IS NULL OR uploaded_bytes_used <= max_upload_bytes-$2)`, *actor.APIKeyID, written)
+		if err != nil {
+			temp.Close()
+			return AssetDTO{}, err
+		}
+		if rows, _ := result.RowsAffected(); rows != 1 {
+			temp.Close()
+		
 	if _, err := tx.ExecContext(ctx, `UPDATE users SET storage_used_bytes=storage_used_bytes+$2,updated_at=now() WHERE user_id=$1`, actor.UserID, written); err != nil {
 		temp.Close()
 		return AssetDTO{}, err
@@ -554,6 +566,9 @@ func (s *Service) load(ctx context.Context, q interface {
 }
 
 func (s *Service) inScope(ctx context.Context, actor Actor, r assetRecord) (bool, error) {
+	if actor.BusinessID != "" && actor.BusinessID != r.BusinessID {
+		return false, nil
+	}
 	if actor.Role == "admin" {
 		return true, nil
 	}
@@ -619,7 +634,22 @@ func problem(status int, code, message string) error {
 func audit(ctx context.Context, tx *sql.Tx, actor, workspace uuid.UUID, event, target string, meta Meta, details any) error {
 	var raw string = "{}"
 	if details != nil {
-		encoded, err := json.Marshal(details)
+		payload := details
+		if meta.AuditDetails != nil {
+			encoded, err := json.Marshal(details)
+			if err != nil { return err }
+			values := map[string]any{}
+			if err != nil {
+				return err
+			}
+			for key, value := range meta.AuditDetails { values[key] = value }
+			if err := json.Unmarshal(encoded, &values); err != nil {
+				return err
+			}
+			for key, value := range meta.AuditDetails {
+				values[key] = value
+			}
+		encoded, err := json.Marshal(payload)
 		if err != nil {
 			return err
 		}

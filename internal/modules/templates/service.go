@@ -466,7 +466,15 @@ func writeAudit(ctx context.Context, tx *sql.Tx, actor, workspace uuid.UUID, act
 	// 1. 模板审计只保存名称、版本与状态摘要，不保存规则正文。
 	raw := []byte(`{}`)
 	if len(details) > 0 && details[0] != nil {
-		encoded, err := json.Marshal(details[0])
+		payload := details[0]
+		if meta.AuditDetails != nil {
+			if values, ok := payload.(map[string]any); ok {
+				for key, value := range meta.AuditDetails {
+					values[key] = value
+				}
+			}
+		}
+		encoded, err := json.Marshal(payload)
 		if err != nil {
 			return err
 		}
