@@ -102,6 +102,10 @@ func (s *Service) Upload(ctx context.Context, actor Actor, input UploadInput, me
 	if mediaType, _, err := mime.ParseMediaType(contentType); err == nil {
 		contentType = mediaType
 	}
+	// 3. APK 的文件结构基于 ZIP，按扩展名修正 MIME，确保下载端仍识别为安装包。
+	if strings.EqualFold(filepath.Ext(fileName), ".apk") {
+		contentType = "application/vnd.android.package-archive"
+	}
 	if _, err := temp.Seek(0, io.SeekStart); err != nil {
 		temp.Close()
 		return AssetDTO{}, err
@@ -346,7 +350,7 @@ func (s *Service) Content(ctx context.Context, actor Actor, rawID string, meta M
 	if s.store == nil {
 		return "", problem(503, "storage_unavailable", "MinIO 存储暂不可用")
 	}
-	value, err := s.store.PresignedGet(ctx, record.Bucket, record.ObjectKey, 15*time.Minute)
+	value, err := s.store.PresignedGet(ctx, record.Bucket, record.ObjectKey, 15*time.Minute, record.ContentType, record.Name)
 	if err != nil {
 		return "", problem(503, "storage_unavailable", "素材存储暂不可用")
 	}

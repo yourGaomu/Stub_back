@@ -61,6 +61,8 @@ type linkRecord struct {
 	AssetSize       sql.NullInt64
 	Bucket          sql.NullString
 	ObjectKey       sql.NullString
+	OriginalName    sql.NullString
+	ContentType     sql.NullString
 	ExpiresAt       sql.NullTime
 	MaxVisits       int64
 	VisitsUsed      int64
@@ -902,7 +904,7 @@ func (s *Service) loadLink(ctx context.Context, q interface {
 	}
 	var r linkRecord
 	var tagsJSON []byte
-	err := q.QueryRowContext(ctx, `SELECT sl.link_id,sl.workspace_id,COALESCE(sl.business_id,a.business_id,''),sl.target_type,sl.target_url,sl.asset_id,a.size_bytes,a.bucket,a.object_key,sl.expires_at,sl.max_visits,sl.visits_used,sl.allowed_ip_cidrs::text,sl.require_password,sl.password_hash,sl.wrong_password_policy,sl.status,sl.template_id,sl.template_version,sc.code,sc.status,sl.created_at,sl.updated_at,sl.title,sl.tags::text FROM short_links sl LEFT JOIN assets a ON a.asset_id=sl.asset_id LEFT JOIN short_link_codes sc ON sc.link_id=sl.link_id AND sc.status='active' WHERE sl.link_id=$1`+suffix, id).Scan(&r.ID, &r.WorkspaceID, &r.BusinessID, &r.TargetType, &r.TargetURL, &r.AssetID, &r.AssetSize, &r.Bucket, &r.ObjectKey, &r.ExpiresAt, &r.MaxVisits, &r.VisitsUsed, &r.IPCIDRs, &r.RequirePassword, &r.PasswordHash, &r.PolicyJSON, &r.Status, &r.TemplateID, &r.TemplateVersion, &r.Code, &r.CodeStatus, &r.CreatedAt, &r.UpdatedAt, &r.Title, &tagsJSON)
+	err := q.QueryRowContext(ctx, `SELECT sl.link_id,sl.workspace_id,COALESCE(sl.business_id,a.business_id,''),sl.target_type,sl.target_url,sl.asset_id,a.size_bytes,a.bucket,a.object_key,a.original_name,a.content_type,sl.expires_at,sl.max_visits,sl.visits_used,sl.allowed_ip_cidrs::text,sl.require_password,sl.password_hash,sl.wrong_password_policy,sl.status,sl.template_id,sl.template_version,sc.code,sc.status,sl.created_at,sl.updated_at,sl.title,sl.tags::text FROM short_links sl LEFT JOIN assets a ON a.asset_id=sl.asset_id LEFT JOIN short_link_codes sc ON sc.link_id=sl.link_id AND sc.status='active' WHERE sl.link_id=$1`+suffix, id).Scan(&r.ID, &r.WorkspaceID, &r.BusinessID, &r.TargetType, &r.TargetURL, &r.AssetID, &r.AssetSize, &r.Bucket, &r.ObjectKey, &r.OriginalName, &r.ContentType, &r.ExpiresAt, &r.MaxVisits, &r.VisitsUsed, &r.IPCIDRs, &r.RequirePassword, &r.PasswordHash, &r.PolicyJSON, &r.Status, &r.TemplateID, &r.TemplateVersion, &r.Code, &r.CodeStatus, &r.CreatedAt, &r.UpdatedAt, &r.Title, &tagsJSON)
 	if err == nil {
 		r.Tags = []string{}
 		err = json.Unmarshal(tagsJSON, &r.Tags)
@@ -1121,7 +1123,7 @@ func (s *Service) consumeAccess(ctx context.Context, tx *sql.Tx, r linkRecord, c
 			return PublicResult{}, err
 		}
 		if assetAvailable && r.Bucket.Valid && r.ObjectKey.Valid && s.store != nil {
-			location, err := s.store.PresignedGet(ctx, r.Bucket.String, r.ObjectKey.String, 15*time.Minute)
+			location, err := s.store.PresignedGet(ctx, r.Bucket.String, r.ObjectKey.String, 15*time.Minute, r.ContentType.String, r.OriginalName.String)
 			if err == nil {
 				return PublicResult{StatusCode: 302, Location: location}, nil
 			}

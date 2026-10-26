@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"mime"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -113,9 +115,22 @@ func (s *Store) Remove(ctx context.Context, bucket, key string) error {
 	return s.internal.RemoveObject(ctx, bucket, key, minio.RemoveObjectOptions{})
 }
 
-func (s *Store) PresignedGet(ctx context.Context, bucket, key string, expires time.Duration) (string, error) {
+func (s *Store) PresignedGet(ctx context.Context, bucket, key string, expires time.Duration, contentType, fileName string) (string, error) {
 	// 1. 仅生成公网 Host 上的短期签名 URL，不发出 MinIO 网络请求。
-	value, err := s.public.PresignedGetObject(ctx, bucket, key, expires, url.Values{})
+	// 2. 保留浏览器对图片、视频等素材的内联预览，并让 APK 按安装包下载。
+	disposition := "inline"
+	if strings.EqualFold(filepath.Ext(fileName), ".apk") {
+		contentType = "application/vnd.android.package-archive"
+		disposition = "attachment"
+	}
+	responseHeaders := url.Values{}
+	if contentType != "" {
+		responseHeaders.Set("response-content-type", contentType)
+	}
+	if fileName != "" {
+		responseHeaders.Set("response-content-disposition", mime.FormatMediaType(disposition, map[string]string{"filename": fileName}))
+	}
+	value, err := s.public.PresignedGetObject(ctx, bucket, key, expires, responseHeaders)
 	if err != nil {
 		return "", err
 	}
