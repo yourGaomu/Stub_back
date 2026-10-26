@@ -86,5 +86,6 @@ func NewRouter(deps Dependencies) (*gin.Engine, error) {
 	registerBusinessRoutes(router, deps)
 	registerAssetRoutes(router, deps)
 	registerLogRoutes(router, deps)
+	registerMCPRoutes(router, deps)
 	return router, nil
 }
