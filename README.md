@@ -10,7 +10,7 @@
 - PostgreSQL 为业务权威数据源，Redis 仅用于短期邮件限流；MinIO 凭据只保留在服务端。
 - 接口和业务规则以产品规格 `SHORT_LINK_CONFIRMED_FEATURES.md` 为准。
 
-服务按 `transport/httpapi`、`modules/*`、`platform/*` 和 `app` 分层。HTTP Handler 负责 DTO/状态码，领域服务负责业务事务，平台包封装数据库、Redis 和 MinIO；权限由 Gin 中间件在进入业务 Handler 前实时检查。详见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
+服务按 `transport/httpapi`、`modules/*`、`platform/*` 和 `app` 分层。HTTP Handler 负责 DTO/状态码，领域服务负责业务事务，平台包封装数据库、Redis 和 MinIO；权限由 Gin 中间件在进入业务 Handler 前实时检查。详见 [架构文档](docs/ARCHITECTURE.md)、[API 文档](docs/API.md) 与[大文件上传方案](docs/LARGE_FILE_UPLOAD_DESIGN.md)。
 
 ## 本地运行
 
@@ -29,7 +29,7 @@
 docker compose --env-file .env up -d --build
 ```
 
-后端不发布宿主机端口，由 Nginx 通过 `web_net` 反向代理到 `short-links-back:8080`。MinIO S3 API 通过 `minio_net` 提供给后端及 Nginx；控制台端口默认仅监听宿主机 `127.0.0.1:9001`。上传文件会暂存到后端容器 `/tmp`；Compose 默认给该临时目录 256 MB，若管理员提高单文件上限或并发上传量，应相应调整该大小。
+后端不发布宿主机端口，由 Nginx 通过 `web_net` 反向代理到 `short-links-back:8080`。MinIO S3 API 通过 `minio_net` 提供给后端及 Nginx；控制台端口默认仅监听宿主机 `127.0.0.1:9001`。普通上传及分片上传都经过后端，分片请求由后端流式写入 MinIO 内网；后端 `/tmp` 已映射到宿主机专用 `./data/upload-tmp` 目录，部署前先执行 `mkdir -p data/upload-tmp && chown 10001:10001 data/upload-tmp`，并按并发量调整容量。分片接口不应把整个大文件一次性读入内存。
 
 ## GitHub Actions 与镜像部署
 

@@ -111,7 +111,7 @@ func registerAuthRoutes(router *gin.Engine, service *auth.Service, db *sql.DB) {
 			writeServiceError(c, err)
 			return
 		}
-		storage := gin.H{"maxSingleFileBytes": quotas.MaxSingleFileBytes, "quotaBytes": quotas.StorageQuotaBytes, "usedBytes": quotas.StorageUsedBytes, "remainingBytes": max(int64(0), quotas.StorageQuotaBytes-quotas.StorageUsedBytes)}
+		storage := gin.H{"maxSingleFileBytes": quotas.MaxSingleFileBytes, "quotaBytes": quotas.StorageQuotaBytes, "usedBytes": quotas.StorageUsedBytes, "reservedBytes": quotas.StorageReservedBytes, "remainingBytes": max(int64(0), quotas.StorageQuotaBytes-quotas.StorageUsedBytes-quotas.StorageReservedBytes)}
 		var urlLimit, assetLimit any = quotas.URLLinkQuota, quotas.MinioAssetLinkQuota
 		var urlRemaining, assetRemaining any = max(0, *quotas.URLLinkQuota-int(quotas.URLLinkUsed)), max(0, *quotas.MinioAssetLinkQuota-int(quotas.MinioAssetLinkUsed))
 		if identity.User.Role == "admin" {

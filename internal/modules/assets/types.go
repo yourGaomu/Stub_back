@@ -1,6 +1,7 @@
 package assets
 
 import (
+	"io"
 	"mime/multipart"
 	"time"
 
@@ -77,4 +78,34 @@ type MetaUpload struct {
 	ContentType    string `json:"contentType"`
 	SizeBytes      int64  `json:"sizeBytes"`
 	ChecksumSHA256 string `json:"checksumSha256"`
+}
+
+type BeginUploadInput struct {
+	BusinessID     string
+	Path           string
+	FileName       string
+	ContentType    string
+	SizeBytes      int64
+	IdempotencyKey string
+}
+
+type UploadPartInput struct {
+	SessionID     string
+	PartNumber    int
+	Reader        io.Reader
+	ContentLength int64
+}
+
+type UploadSessionDTO struct {
+	UploadSessionID string    `json:"uploadSessionId"`
+	IdempotencyKey  string    `json:"idempotencyKey,omitempty"`
+	Status          string    `json:"status"`
+	FileName        string    `json:"fileName"`
+	SizeBytes       int64     `json:"sizeBytes"`
+	PartSizeBytes   int64     `json:"partSizeBytes"`
+	PartCount       int       `json:"partCount"`
+	ReceivedParts   []int     `json:"receivedParts"`
+	ReceivedBytes   int64     `json:"receivedBytes"`
+	ExpiresAt       time.Time `json:"expiresAt"`
+	Asset           *AssetDTO `json:"asset,omitempty"`
 }

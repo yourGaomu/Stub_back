@@ -144,8 +144,10 @@ func requireMultipartBusinessAccess(db *sql.DB) gin.HandlerFunc {
 			writeError(c, http.StatusInternalServerError, "quota_check_failed", "服务内部错误")
 			return
 		}
-		limit := int64(math.MaxInt64)
-		if maxSingle <= math.MaxInt64-(2<<20) {
+		// 2. 普通 multipart 接口固定限制在 100 MiB；更大的文件必须使用分片会话。
+		const normalUploadLimit = int64(100 * 1024 * 1024)
+		limit := normalUploadLimit + (2 << 20)
+		if maxSingle < normalUploadLimit && maxSingle <= math.MaxInt64-(2<<20) {
 			limit = maxSingle + (2 << 20)
 		}
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)

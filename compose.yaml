@@ -99,8 +99,8 @@ services:
       minio:
         condition: service_started
     read_only: true
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,size=256m
+    volumes:
+      - ./data/upload-tmp:/tmp
     cap_drop:
       - ALL
     security_opt:

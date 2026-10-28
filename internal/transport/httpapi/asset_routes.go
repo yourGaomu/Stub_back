@@ -14,6 +14,72 @@ func registerAssetRoutes(router *gin.Engine, deps Dependencies) {
 	api := router.Group("/api/v1")
 	api.Use(authenticate(deps.Auth))
 	api.Use(requireAPIKeyBusinessAccess(deps.DB))
+	api.GET("/assets/uploads", requirePermission(deps.DB, "assets.upload"), func(c *gin.Context) {
+		result, err := service.ListMultipartUploads(c.Request.Context(), assetActor(c))
+		if err != nil {
+			writeServiceError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"items": result})
+	})
+	api.POST("/assets/uploads", requirePermission(deps.DB, "assets.upload"), func(c *gin.Context) {
+		var input struct {
+			BusinessID     string `json:"businessId"`
+			Path           string `json:"path"`
+			FileName       string `json:"fileName"`
+			ContentType    string `json:"contentType"`
+			SizeBytes      int64  `json:"sizeBytes"`
+			IdempotencyKey string `json:"idempotencyKey"`
+		}
+		if err := c.ShouldBindJSON(&input); err != nil {
+			writeError(c, http.StatusUnprocessableEntity, "invalid_upload", "上传会话参数无效")
+			return
+		}
+		if keyBusiness := apiKeyBusinessID(c); keyBusiness != "" {
+			if input.BusinessID != "" && input.BusinessID != keyBusiness {
+				writeError(c, http.StatusForbidden, "api_key_business_denied", "API Key 未授权该业务")
+				return
+			}
+			input.BusinessID = keyBusiness
+		}
+		result, err := service.BeginMultipartUpload(c.Request.Context(), assetActor(c), assets.BeginUploadInput{BusinessID: input.BusinessID, Path: input.Path, FileName: input.FileName, ContentType: input.ContentType, SizeBytes: input.SizeBytes, IdempotencyKey: input.IdempotencyKey})
+		if err != nil {
+			writeServiceError(c, err)
+			return
+		}
+		c.JSON(http.StatusCreated, result)
+	})
+	api.PUT("/assets/uploads/:uploadSessionId/parts/:partNumber", requirePermission(deps.DB, "assets.upload"), func(c *gin.Context) {
+		partNumber, err := strconv.Atoi(c.Param("partNumber"))
+		if err != nil {
+			writeError(c, http.StatusUnprocessableEntity, "upload_part_invalid", "分片序号无效")
+			return
+		}
+		const maxPartSize = int64(32 * 1024 * 1024)
+		if c.Request.ContentLength > maxPartSize || c.Request.ContentLength < 0 {
+			writeError(c, http.StatusRequestEntityTooLarge, "upload_part_invalid", "分片请求必须提供不超过 32 MiB 的 Content-Length")
+			return
+		}
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxPartSize)
+		result, err := service.UploadMultipartPart(c.Request.Context(), assetActor(c), assets.UploadPartInput{SessionID: c.Param("uploadSessionId"), PartNumber: partNumber, Reader: c.Request.Body, ContentLength: c.Request.ContentLength})
+		if err != nil {
+			writeServiceError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, result)
+	})
+	api.GET("/assets/uploads/:uploadSessionId", requirePermission(deps.DB, "assets.upload"), func(c *gin.Context) {
+		result, err := service.GetMultipartUpload(c.Request.Context(), assetActor(c), c.Param("uploadSessionId"))
+		if err != nil {
+			writeServiceError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, result)
+	})
+	api.POST("/assets/uploads/:uploadSessionId/complete", requirePermission(deps.DB, "assets.upload"), func(c *gin.Context) {
+		result, err := service.CompleteMultipartUpload(c.Request.Context(), assetActor(c), c.Param("uploadSessionId"), assetMeta(c))
+		if err != nil {
+			writeServiceErr
 	api.POST("/assets", requirePermission(deps.DB, "assets.upload"), requireMultipartBusinessAccess(deps.DB), func(c *gin.Context) {
 		form := c.Request.MultipartForm
 		if form == nil || len(form.File["file"]) != 1 {

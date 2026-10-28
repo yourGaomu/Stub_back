@@ -19,10 +19,11 @@ import (
 )
 
 type mcpContext struct {
-	actor      links.Actor
-	linkMeta   links.RequestMeta
-	assetActor assets.Actor
-	assetMeta  assets.Meta
+	actor        links.Actor
+	linkMeta     links.RequestMeta
+	assetActor   assets.Actor
+	assetMeta    assets.Meta
+	apiKeyScopes map[string]bool
 }
 
 type jsonRPCRequest struct {
@@ -109,7 +110,7 @@ var mcpAvailableTools = []mcpToolDefinition{
 	},
 	{
 		Name:        "upload_file_and_share",
-		Description: "将文件数据（Base64 编码）上传至云端素材库并自动生成直接下载短链。适合 Agent 向用户交付刚刚生成的报表、代码包、图片或文本文件。",
+		Description: "将不超过 7 MiB 的小文件内容（Base64 编码）上传至云端素材库并自动生成下载短链。大文件请使用分片上传工具。",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -132,6 +133,30 @@ var mcpAvailableTools = []mcpToolDefinition{
 			},
 			"required": []string{"fileName", "fileContentBase64"},
 		},
+	},
+	{
+		Name: "begin_asset_upload", Description: "为文件内容创建分片上传会话并预留用户存储额度。随后用 upload_asset_part 逐片发送实际内容。",
+		InputSchema: map[string]any{"type": "object", "properties": map[string]any{
+			"fileName": map[string]any{"type": "string"}, "contentType": map[string]any{"type": "string"}, "sizeBytes": map[string]any{"type": "integer"}, "path": map[string]any{"type": "string"}, "businessId": map[string]any{"type": "string"}, "idempotencyKey": map[string]any{"type": "string"},
+		}, "required": []string{"fileName", "sizeBytes"}},
+	},
+	{
+		Name: "upload_asset_part", Description: "上传一个分片的实际文件内容。contentBase64 仅是单个分片，不能传入本地路径或整个大文件。",
+		InputSchema: map[string]any{"type": "object", "properties": map[string]any{
+			"uploadSessionId": map[string]any{"type": "string"}, "partNumber": map[string]any{"type": "integer"}, "contentBase64": map[string]any{"type": "string"},
+		}, "required": []string{"uploadSessionId", "partNumber", "contentBase64"}},
+	},
+	{
+		Name: "get_asset_upload_status", Description: "查询分片上传已接收的分片、总进度和会话状态。",
+		InputSchema: map[string]any{"type": "object", "properties": map[string]any{"uploadSessionId": map[string]any{"type": "string"}}, "required": []string{"uploadSessionId"}},
+	},
+	{
+		Name: "complete_asset_upload", Description: "校验并合并全部分片，将预留额度结算为已用额度。",
+		InputSchema: map[string]any{"type": "object", "properties": map[string]any{"uploadSessionId": map[string]any{"type": "string"}}, "required": []string{"uploadSessionId"}},
+	},
+	{
+		Name: "cancel_asset_upload", Description: "取消未完成的分片上传，清理 MinIO 分片并释放预留额度。",
+		InputSchema: map[string]any{"type": "object", "properties": map[string]any{"uploadSessionId": map[string]any{"type": "string"}}, "required": []string{"uploadSessionId"}},
 	},
 	{
 		Name:        "get_link_info",
@@ -168,7 +193,7 @@ func registerMCPRoutes(router *gin.Engine, deps Dependencies) {
 	mcp.Use(mcpAuthenticate(deps.Auth))
 
 	mcp.POST("", func(c *gin.Context) {
-		bodyBytes, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, 10<<20))
+		bodyBytes, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, 48<<20))
 		if err != nil {
 			c.JSON(http.StatusBadRequest, jsonRPCResponse{
 				JSONRPC: "2.0",
@@ -191,6 +216,9 @@ func registerMCPRoutes(router *gin.Engine, deps Dependencies) {
 			linkMeta:   linkMeta(c),
 			assetActor: assetActor(c),
 			assetMeta:  assetMeta(c),
+		}
+		if identity := currentAuth(c); identity.APIKey != nil {
+			mCtx.apiKeyScopes = identity.APIKey.Scopes
 		}
 
 		resp := handleMCPMethod(c.Request.Context(), rpcReq, mCtx, deps)
@@ -414,6 +442,9 @@ func executeMCPTool(ctx context.Context, name string, args map[string]any, mCtx 
 		if b64Content == "" {
 			return "错误: 必须提供 fileContentBase64 参数", true
 		}
+		if len(b64Content) > 10<<20 {
+			return "错误: 单次 MCP 上传仅支持不超过 7 MiB 的小文件，大文件请使用分片上传工具", true
+		}
 
 		// 兼容标准 Base64 及带有 data:image/png;base64, 前缀的数据
 		if idx := strings.Index(b64Content, ";base64,"); idx != -1 {
@@ -478,6 +509,78 @@ func executeMCPTool(ctx context.Context, name string, args map[string]any, mCtx 
 		return fmt.Sprintf("文件已成功上传至素材库并生成下载短链！\n- 文件名：%s (大小: %d 字节)\n- 短链直链：%s\n- 短码：/r/%s\n- 素材 ID：%s\n- 存储业务桶：%s",
 			fileName, len(fileBytes), linkRes.URL, linkRes.Code, assetRes.AssetID, assetRes.BusinessID), false
 
+	case "begin_asset_upload":
+		if err := requireMCPAssetUpload(ctx, mCtx, deps); err != nil {
+			return err.Error(), true
+		}
+		businessID := mCtx.assetActor.BusinessID
+		if businessID == "" {
+			businessID = getArgString(args, "businessId")
+		}
+		path := getArgString(args, "path")
+		if path == "" {
+			path = "agent-uploads"
+		}
+		result, err := deps.Assets.BeginMultipartUpload(ctx, mCtx.assetActor, assets.BeginUploadInput{BusinessID: businessID, Path: path, FileName: getArgString(args, "fileName"), ContentType: getArgString(args, "contentType"), SizeBytes: int64(getArgNumber(args, "sizeBytes")), IdempotencyKey: getArgString(args, "idempotencyKey")})
+		if err != nil {
+			return fmt.Sprintf("创建上传会话失败: %v", err), true
+		}
+		return marshalMCPResult(result)
+
+	case "upload_asset_part":
+		if err := requireMCPAssetUpload(ctx, mCtx, deps); err != nil {
+			return err.Error(), true
+		}
+		raw := strings.TrimSpace(getArgString(args, "contentBase64"))
+		if idx := strings.Index(raw, ";base64,"); idx >= 0 {
+			raw = raw[idx+8:]
+		}
+		decodedSize := int64(base64.StdEncoding.DecodedLen(len(raw)))
+		if strings.HasSuffix(raw, "==") {
+			decodedSize -= 2
+		} else if strings.HasSuffix(raw, "=") {
+			decodedSize--
+		}
+		if decodedSize <= 0 || decodedSize > 32*1024*1024 {
+			return "错误: 单个分片内容必须大于 0 且不超过 32 MiB", true
+		}
+		reader := base64.NewDecoder(base64.StdEncoding, strings.NewReader(raw))
+		result, err := deps.Assets.UploadMultipartPart(ctx, mCtx.assetActor, assets.UploadPartInput{SessionID: getArgString(args, "uploadSessionId"), PartNumber: int(getArgNumber(args, "partNumber")), Reader: reader, ContentLength: decodedSize})
+		if err != nil {
+			return fmt.Sprintf("上传分片失败: %v", err), true
+		}
+		return marshalMCPResult(result)
+
+	case "get_asset_upload_status":
+		if err := requireMCPAssetUpload(ctx, mCtx, deps); err != nil {
+			return err.Error(), true
+		}
+		result, err := deps.Assets.GetMultipartUpload(ctx, mCtx.assetActor, getArgString(args, "uploadSessionId"))
+		if err != nil {
+			return fmt.Sprintf("查询上传状态失败: %v", err), true
+		}
+		return marshalMCPResult(result)
+
+	case "complete_asset_upload":
+		if err := requireMCPAssetUpload(ctx, mCtx, deps); err != nil {
+			return err.Error(), true
+		}
+		result, err := deps.Assets.CompleteMultipartUpload(ctx, mCtx.assetActor, getArgString(args, "uploadSessionId"), mCtx.assetMeta)
+		if err != nil {
+			return fmt.Sprintf("完成上传失败: %v", err), true
+		}
+		return marshalMCPResult(result)
+
+	case "cancel_asset_upload":
+		if err := requireMCPAssetUpload(ctx, mCtx, deps); err != nil {
+			return err.Error(), true
+		}
+		result, err := deps.Assets.CancelMultipartUpload(ctx, mCtx.assetActor, getArgString(args, "uploadSessionId"))
+		if err != nil {
+			return fmt.Sprintf("取消上传失败: %v", err), true
+		}
+		return marshalMCPResult(result)
+
 	case "get_link_info":
 		code := cleanCodeParam(getArgString(args, "code"))
 		if code == "" {
@@ -536,6 +639,41 @@ func getArgString(args map[string]any, key string) string {
 		return strings.TrimSpace(val)
 	}
 	return ""
+}
+
+func getArgNumber(args map[string]any, key string) float64 {
+	if value, ok := args[key].(float64); ok {
+		return value
+	}
+	return 0
+}
+
+func marshalMCPResult(value any) (string, bool) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Sprintf("序列化上传结果失败: %v", err), true
+	}
+	return string(encoded), false
+}
+
+func requireMCPAssetUpload(ctx context.Context, mCtx mcpContext, deps Dependencies) error {
+	if mCtx.assetActor.APIKeyID != nil {
+		if !mCtx.apiKeyScopes["assets.upload"] {
+			return fmt.Errorf("当前 API Key 没有 assets.upload 权限")
+		}
+		return nil
+	}
+	if mCtx.assetActor.Role == "admin" {
+		return nil
+	}
+	var allowed bool
+	if err := deps.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM user_permissions WHERE user_id=$1 AND permission_code='assets.upload' AND granted_at IS NOT NULL AND revoked_at IS NULL)`, mCtx.assetActor.UserID).Scan(&allowed); err != nil {
+		return fmt.Errorf("检查素材上传权限失败")
+	}
+	if !allowed {
+		return fmt.Errorf("当前账号没有素材上传权限")
+	}
+	return nil
 }
 
 func cleanCodeParam(raw string) string {

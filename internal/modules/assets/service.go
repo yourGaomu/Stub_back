@@ -123,9 +123,9 @@ func (s *Service) Upload(ctx context.Context, actor Actor, input UploadInput, me
 	}
 	defer tx.Rollback()
 	var role string
-	var storageUsed, storageQuota int64
+	var storageUsed, storageReserved, storageQuota int64
 	var lockedMax int64
-	if err := tx.QueryRowContext(ctx, `SELECT role,max_single_file_bytes,storage_used_bytes,storage_quota_bytes FROM users WHERE user_id=$1 FOR UPDATE`, actor.UserID).Scan(&role, &lockedMax, &storageUsed, &storageQuota); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT role,max_single_file_bytes,storage_used_bytes,storage_reserved_bytes,storage_quota_bytes FROM users WHERE user_id=$1 FOR UPDATE`, actor.UserID).Scan(&role, &lockedMax, &storageUsed, &storageReserved, &storageQuota); err != nil {
 		temp.Close()
 		return AssetDTO{}, err
 	}
@@ -136,7 +136,7 @@ func (s *Service) Upload(ctx context.Context, actor Actor, input UploadInput, me
 		temp.Close()
 		return AssetDTO{}, problem(413, "upload_quota_exceeded", "文件超过单次上传大小限制")
 	}
-	if storageUsed > storageQuota || written > storageQuota-storageUsed {
+	if storageUsed > storageQuota || storageReserved > storageQuota-storageUsed || written > storageQuota-storageUsed-storageReserved {
 		temp.Close()
 		return AssetDTO{}, problem(413, "upload_quota_exceeded", "用户素材总存储额度不足")
 	}

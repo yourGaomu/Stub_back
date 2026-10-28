@@ -82,15 +82,16 @@ type AdminUsersPage struct {
 }
 
 type Quotas struct {
-	MaxSingleFileBytes  int64 `json:"maxSingleFileBytes"`
-	StorageQuotaBytes   int64 `json:"storageQuotaBytes"`
-	StorageUsedBytes    int64 `json:"storageUsedBytes"`
-	APIKeyQuota         int   `json:"apiKeyQuota"`
-	APIKeyUsed          int64 `json:"apiKeyUsed"`
-	URLLinkQuota        *int  `json:"urlLinkQuota"`
-	URLLinkUsed         int64 `json:"urlLinkUsed"`
-	MinioAssetLinkQuota *int  `json:"minioAssetLinkQuota"`
-	MinioAssetLinkUsed  int64 `json:"minioAssetLinkUsed"`
+	MaxSingleFileBytes   int64 `json:"maxSingleFileBytes"`
+	StorageQuotaBytes    int64 `json:"storageQuotaBytes"`
+	StorageUsedBytes     int64 `json:"storageUsedBytes"`
+	StorageReservedBytes int64 `json:"storageReservedBytes"`
+	APIKeyQuota          int   `json:"apiKeyQuota"`
+	APIKeyUsed           int64 `json:"apiKeyUsed"`
+	URLLinkQuota         *int  `json:"urlLinkQuota"`
+	URLLinkUsed          int64 `json:"urlLinkUsed"`
+	MinioAssetLinkQuota  *int  `json:"minioAssetLinkQuota"`
+	MinioAssetLinkUsed   int64 `json:"minioAssetLinkUsed"`
 }
 
 type QuotaPatch struct {
@@ -386,7 +387,7 @@ func (s *Service) AdminUser(ctx context.Context, id uuid.UUID) (AdminUserItem, e
 func (s *Service) UserQuotas(ctx context.Context, id uuid.UUID) (Quotas, error) {
 	var q Quotas
 	var urlQuota, assetQuota int
-	err := s.db.QueryRowContext(ctx, `SELECT max_single_file_bytes,storage_quota_bytes,storage_used_bytes,api_key_quota,(SELECT count(*) FROM api_keys k WHERE k.user_id=u.user_id AND k.status IN ('active','disabled')),url_link_quota,minio_asset_link_quota,(SELECT count(*) FROM short_links l WHERE l.created_by=u.user_id AND l.target_type='url'),(SELECT count(*) FROM short_links l WHERE l.created_by=u.user_id AND l.target_type='minio_asset') FROM users u WHERE user_id=$1`, id).Scan(&q.MaxSingleFileBytes, &q.StorageQuotaBytes, &q.StorageUsedBytes, &q.APIKeyQuota, &q.APIKeyUsed, &urlQuota, &assetQuota, &q.URLLinkUsed, &q.MinioAssetLinkUsed)
+	err := s.db.QueryRowContext(ctx, `SELECT max_single_file_bytes,storage_quota_bytes,storage_used_bytes,storage_reserved_bytes,api_key_quota,(SELECT count(*) FROM api_keys k WHERE k.user_id=u.user_id AND k.status IN ('active','disabled')),url_link_quota,minio_asset_link_quota,(SELECT count(*) FROM short_links l WHERE l.created_by=u.user_id AND l.target_type='url'),(SELECT count(*) FROM short_links l WHERE l.created_by=u.user_id AND l.target_type='minio_asset') FROM users u WHERE user_id=$1`, id).Scan(&q.MaxSingleFileBytes, &q.StorageQuotaBytes, &q.StorageUsedBytes, &q.StorageReservedBytes, &q.APIKeyQuota, &q.APIKeyUsed, &urlQuota, &assetQuota, &q.URLLinkUsed, &q.MinioAssetLinkUsed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Quotas{}, problem(404, "user_not_found", "用户不存在")
 	}
