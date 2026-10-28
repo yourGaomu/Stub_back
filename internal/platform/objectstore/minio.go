@@ -19,7 +19,6 @@ type Store struct {
 	internal *minio.Client
 	public   *minio.Client
 	core     *minio.Core
-	cance
 	cancel   context.CancelFunc
 }
 
@@ -78,6 +77,7 @@ func New(cfg config.Config) (*Store, error) {
 	cancel, err := internalClient.HealthCheck(10 * time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("启动 MinIO 健康检查失败: %w", err)
+	}
 	return &Store{internal: internalClient, public: publicClient, core: &minio.Core{Client: internalClient}, cancel: cancel}, nil
 }
 
@@ -131,7 +131,6 @@ func (s *Store) AbortMultipartForObject(ctx context.Context, bucket, key string)
 func (s *Store) ObjectSize(ctx context.Context, bucket, key string) (int64, error) {
 	info, err := s.internal.StatObject(ctx, bucket, key, minio.StatObjectOptions{})
 	return info.Size, err
-	return &Store{internal: internalClient, public: publicClient, cancel: cancel}, nil
 }
 
 func (s *Store) Put(ctx context.Context, bucket, key, contentType string, reader io.Reader, size int64) error {

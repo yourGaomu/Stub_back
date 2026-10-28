@@ -79,7 +79,19 @@ func registerAssetRoutes(router *gin.Engine, deps Dependencies) {
 	api.POST("/assets/uploads/:uploadSessionId/complete", requirePermission(deps.DB, "assets.upload"), func(c *gin.Context) {
 		result, err := service.CompleteMultipartUpload(c.Request.Context(), assetActor(c), c.Param("uploadSessionId"), assetMeta(c))
 		if err != nil {
-			writeServiceErr
+			writeServiceError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, result)
+	})
+	api.DELETE("/assets/uploads/:uploadSessionId", requirePermission(deps.DB, "assets.upload"), func(c *gin.Context) {
+		result, err := service.CancelMultipartUpload(c.Request.Context(), assetActor(c), c.Param("uploadSessionId"))
+		if err != nil {
+			writeServiceError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, result)
+	})
 	api.POST("/assets", requirePermission(deps.DB, "assets.upload"), requireMultipartBusinessAccess(deps.DB), func(c *gin.Context) {
 		form := c.Request.MultipartForm
 		if form == nil || len(form.File["file"]) != 1 {

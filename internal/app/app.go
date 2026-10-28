@@ -139,7 +139,9 @@ func (a *App) startAssetCleaner(service *assets.Service) {
 			if err := service.PurgeExpired(workCtx, 20); err != nil && ctx.Err() == nil {
 				a.logger.Error("asset_purge_failed", "error", err)
 			}
-			if err := service.CleanupMultipartUploads(work
+			if err := service.CleanupMultipartUploads(workCtx, 20); err != nil && ctx.Err() == nil {
+				a.logger.Error("asset_upload_cleanup_failed", "error", err)
+			}
 			workCancel()
 			select {
 			case <-ctx.Done():
