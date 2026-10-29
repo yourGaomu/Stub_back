@@ -705,7 +705,7 @@ func (s *Service) releaseUploadReservationTx(ctx context.Context, tx *sql.Tx, se
 			return fmt.Errorf("release API Key upload reservation: %w", err)
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE asset_upload_sessions SET api_quota_reserved=false,status=$2,cancelled_at=CASE WHEN $2='cancelled' THEN now() ELSE cancelled_at END,last_error=NULLIF($3,''),updated_at=now() WHERE upload_session_id=$1 AND status<>'completed'`, session.ID, status, reason); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE asset_upload_sessions SET api_quota_reserved=false,status=$2::varchar,cancelled_at=CASE WHEN $2::varchar='cancelled' THEN now() ELSE cancelled_at END,last_error=NULLIF($3::text,''),updated_at=now() WHERE upload_session_id=$1 AND status<>'completed'`, session.ID, status, reason); err != nil {
 		return fmt.Errorf("finish upload session quota release: %w", err)
 	}
 	return nil

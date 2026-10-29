@@ -493,7 +493,7 @@ func expectReservationRelease(mock sqlmock.Sqlmock, session uploadSessionRecord,
 		WithArgs(session.ID).WillReturnRows(sqlmock.NewRows([]string{"api_quota_reserved", "status"}).AddRow(false, "cleanup_pending"))
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE users SET storage_reserved_bytes=GREATEST(0,storage_reserved_bytes-$2),updated_at=now() WHERE user_id=$1`)).
 		WithArgs(session.OwnerID, session.Reserved).WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE asset_upload_sessions SET api_quota_reserved=false,status=$2,cancelled_at=CASE WHEN $2='cancelled' THEN now() ELSE cancelled_at END,last_error=NULLIF($3,''),updated_at=now() WHERE upload_session_id=$1 AND status<>'completed'`)).
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE asset_upload_sessions SET api_quota_reserved=false,status=$2::varchar,cancelled_at=CASE WHEN $2::varchar='cancelled' THEN now() ELSE cancelled_at END,last_error=NULLIF($3::text,''),updated_at=now() WHERE upload_session_id=$1 AND status<>'completed'`)).
 		WithArgs(session.ID, status, "").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 }
