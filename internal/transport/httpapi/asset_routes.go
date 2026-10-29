@@ -1,6 +1,9 @@
 package httpapi
 
 import (
+	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"strconv"
 
@@ -31,7 +34,17 @@ func registerAssetRoutes(router *gin.Engine, deps Dependencies) {
 			SizeBytes      int64  `json:"sizeBytes"`
 			IdempotencyKey string `json:"idempotencyKey"`
 		}
-		if err := c.ShouldBindJSON(&input); err != nil {
+		body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20))
+		if err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				writeError(c, http.StatusRequestEntityTooLarge, "upload_request_too_large", "上传会话参数超过允许大小")
+				return
+			}
+			writeError(c, http.StatusUnprocessableEntity, "invalid_upload", "上传会话参数无效")
+			return
+		}
+		if err := json.Unmarshal(body, &input); err != nil {
 			writeError(c, http.StatusUnprocessableEntity, "invalid_upload", "上传会话参数无效")
 			return
 		}

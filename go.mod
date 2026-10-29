@@ -3,13 +3,14 @@ module github.com/yourGaomu/short_links/back
 go 1.26.0
 
 require (
+	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/alexedwards/argon2id v1.0.0
 	github.com/gin-contrib/cors v1.7.3
 	github.com/gin-gonic/gin v1.10.1
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.7.1
-	github.com/minio/minio-go/v7 v7.0.83
 	github.com/joho/godotenv v1.5.1
+	github.com/minio/minio-go/v7 v7.0.83
 	github.com/pressly/goose/v3 v3.24.1
 	github.com/redis/go-redis/v9 v9.7.0
 	github.com/wneessen/go-mail v0.8.1

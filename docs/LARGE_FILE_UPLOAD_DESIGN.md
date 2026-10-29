@@ -39,11 +39,11 @@
 4. 用户尚未超过同时进行的上传会话数量限制。
 5. 对该文件大小增加 storage_reserved_bytes，并建立待创建的上传会话记录。
 
-MinIO 的 multipart 创建操作不能和数据库事务组成一个原子事务。后端把会话先记为 initializing 并完成额度预留，再调用 MinIO 创建 multipart upload；成功后保存 MinIO upload ID 并转为 uploading。MinIO 创建失败时，把会话标记为 failed 并释放预留；后台 worker 负责回收遗留会话。
+MinIO 的 multipart 创建操作不能和数据库事务组成一个原子事务。后端把会话先记为 `initializing` 并完成额度预留，再调用 MinIO 创建 multipart upload；成功后保存 MinIO upload ID 并转为 `uploading`。MinIO 创建失败时先清理可能已创建的对象存储会话，清理成功后标记为 `failed` 并释放预留；清理失败则保留 `cleanup_pending` 和额度，由后台 worker 重试。
 
 完成上传后，先验证 MinIO 对象已合并、实际大小等于预期值，再在同一个数据库事务中创建素材记录、增加 storage_used_bytes、减少 storage_reserved_bytes，并把会话标记为 completed。不得先释放预留再增加已用额度。
 
-取消、过期、合并失败或对象校验失败时，先调用 MinIO AbortMultipartUpload；如果对象已经合并则删除对象。只有 MinIO 确认清理成功后才能释放 storage_reserved_bytes。MinIO 暂时不可用时，会话进入 cleanup_pending，预留保留并由后台任务重试。后台任务也应处理进程崩溃后遗留的 creating、completing 和 cleanup_pending 会话。
+取消、过期、合并失败或对象校验失败时，先调用 MinIO AbortMultipartUpload；如果对象已经合并则删除对象。只有 MinIO 确认清理成功后才能释放 `storage_reserved_bytes`。MinIO 暂时不可用时，会话进入 `cleanup_pending`，预留保留并由后台任务重试。后台任务也处理进程崩溃后遗留的 `initializing`、`completing` 和 `cleanup_pending` 会话。
 
 API Key 若配置了独立累计上传额度，也应在创建会话时预留，完成时结算，取消时释放；不能只在最终完成时才检查，否则多个并发会话可能共同超额。
 
@@ -88,10 +88,10 @@ API Key 若配置了独立累计上传额度，也应在创建会话时预留，
 
 1. 所有分片上传完成后，客户端调用完成接口。
 2. 后端锁定会话并检查状态；从 MinIO 查询已收分片，确认分片号连续、分片数符合预期、总长度等于预期文件大小。
-3. 后端调用 MinIO CompleteMultipartUpload，并用 HeadObject 再次核验实际对象大小。
+3. 后端调用 MinIO CompleteMultipartUpload，并用 HeadObject 再次核验实际对象大小。合并成功但大小查询暂时失败时保留 `completing` 状态、对象和额度，返回可重试错误；只有确认大小不符时才清理对象。
 4. 核验成功后，事务性地登记素材、把预留额度转为已用额度，并返回素材 DTO。重复完成请求返回同一个素材结果。
 5. 任一步校验失败时，后端清理 MinIO 分片或已合并对象；清理确认后释放预留额度。
-6. 用户取消时，后端调用 MinIO AbortMultipartUpload，成功后释放预留额度并标记 cancelled。
+6. 用户取消时，后端先锁定并标记清理状态，等待已开始的分片或合并操作结束，再中止 MinIO 分片并检查/删除已合并对象。只有确认清理成功后才释放预留额度；MinIO 暂不可用时返回 `503 storage_unavailable` 并保留 `cleanup_pending`。
 7. 到期清理任务周期性扫描过期会话，执行同样的 MinIO 清理和额度释放流程。
 
 ## 5. 前端页面需要的功能
@@ -175,8 +175,7 @@ PUT /api/v1/assets/uploads/{uploadSessionId}/parts/{partNumber}
 请求体：浏览器和 SDK 发送当前分片的原始二进制内容，不使用 multipart，不使用 Base64。MCP JSON-RPC 工具由于参数协议限制，使用 Base64 表达单个分片，不能一次传输整个大文件。
 
 成功响应 200：
-
-成功响应 200：返回更新后的上传会话 DTO。
+返回更新后的上传会话 DTO。
 
 ### 6.4 完成上传
 
@@ -186,7 +185,7 @@ POST /api/v1/assets/uploads/{uploadSessionId}/complete
 
 请求：无请求体。
 
-成功响应 201：
+成功响应 200：
 
     {
       "asset": {
@@ -208,7 +207,7 @@ POST /api/v1/assets/uploads/{uploadSessionId}/complete
 
 DELETE /api/v1/assets/uploads/{uploadSessionId}
 
-作用：取消本人尚未完成的会话，清理 MinIO 分片并释放额度；只有清理成功才返回 cancelled。
+作用：取消本人尚未完成的会话，清理 MinIO 分片并释放额度；只有确认清理成功才返回 cancelled。存储暂不可用时返回 503 并保留 cleanup_pending，后台继续重试；活动会话列表会继续展示清理状态，清理完成后标为 cancelled 并释放预留额度。
 
 成功响应 200：
 

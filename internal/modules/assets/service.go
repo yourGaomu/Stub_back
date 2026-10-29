@@ -21,17 +21,31 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/yourGaomu/short_links/back/internal/platform/objectstore"
+	"github.com/minio/minio-go/v7"
 )
 
 const recoveryPeriod = 7 * 24 * time.Hour
 
 type Service struct {
 	db    *sql.DB
-	store *objectstore.Store
+	store assetObjectStore
 }
 
-func NewService(db *sql.DB, store *objectstore.Store) *Service { return &Service{db: db, store: store} }
+type assetObjectStore interface {
+	ObjectExists(context.Context, string, string) (bool, error)
+	ObjectSize(context.Context, string, string) (int64, error)
+	Put(context.Context, string, string, string, io.Reader, int64) error
+	Remove(context.Context, string, string) error
+	PresignedGet(context.Context, string, string, time.Duration, string, string) (string, error)
+	BeginMultipart(context.Context, string, string, string) (string, error)
+	PutMultipartPart(context.Context, string, string, string, int, io.Reader, int64) (string, error)
+	ListMultipartParts(context.Context, string, string, string) ([]minio.ObjectPart, error)
+	CompleteMultipart(context.Context, string, string, string, []minio.CompletePart, string) error
+	AbortMultipart(context.Context, string, string, string) error
+	AbortMultipartForObject(context.Context, string, string) error
+}
+
+func NewService(db *sql.DB, store assetObjectStore) *Service { return &Service{db: db, store: store} }
 
 type assetRecord struct {
 	ID, WorkspaceID, OwnerID                                         uuid.UUID
@@ -41,7 +55,7 @@ type assetRecord struct {
 	CreatedAt                                                        time.Time
 }
 
-func (s *Service) Upload(ctx context.Context, actor Actor, input UploadInput, meta Meta) (AssetDTO, error) {
+func (s *Service) Upload(ctx context.Context, actor Actor, input UploadInput, meta Meta) (assetDTO AssetDTO, returnErr error) {
 	// 1. 验证上传 DTO 和逻辑目录；MinIO object key 始终由服务端生成。
 	if input.File == nil || strings.TrimSpace(input.BusinessID) == "" {
 		return AssetDTO{}, problem(422, "invalid_upload", "businessId、path 和 file 均为必填项")
@@ -186,6 +200,12 @@ func (s *Service) Upload(ctx context.Context, actor Actor, input UploadInput, me
 	}
 	if err := s.store.Put(ctx, bucket, objectKey, contentType, temp, written); err != nil {
 		temp.Close()
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		cleanupErr := s.store.Remove(cleanupCtx, bucket, objectKey)
+		cancel()
+		if cleanupErr != nil {
+			return AssetDTO{}, fmt.Errorf("写入素材失败: %w; 清理可能已写入的对象也失败: %v", err, cleanupErr)
+		}
 		return AssetDTO{}, problem(503, "storage_unavailable", "素材存储暂不可用")
 	}
 	committed := false
@@ -193,7 +213,9 @@ func (s *Service) Upload(ctx context.Context, actor Actor, input UploadInput, me
 		if !committed {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			_ = s.store.Remove(cleanupCtx, bucket, objectKey)
+			if cleanupErr := s.store.Remove(cleanupCtx, bucket, objectKey); cleanupErr != nil {
+				returnErr = errors.Join(returnErr, fmt.Errorf("清理未登记的素材对象失败: %w", cleanupErr))
+			}
 		}
 	}()
 	if _, err := tx.ExecContext(ctx, `INSERT INTO assets(asset_id,workspace_id,owner_user_id,business_id,logical_path,bucket,object_key,original_name,content_type,size_bytes,checksum_sha256,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, assetID, actor.WorkspaceID, actor.UserID, input.BusinessID, logicalPath, bucket, objectKey, fileName, contentType, written, checksum, now); err != nil {

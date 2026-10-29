@@ -122,12 +122,12 @@ API Key 相关错误还包括：`api_key_owner_permission_denied`（所属用户
 | --- | --- | --- | --- |
 | `GET /me/businesses` | 查询当前可访问业务 | 无 | `200`: `{items}` |
 | `POST /assets` | 上传单个素材；`assets.upload` 且必须获准访问业务 | 人类会话 multipart 必传 `businessId`；API Key 不传该字段，由服务端注入 Key 绑定业务；另传 `path`, `file` | `201`: `assetId`, 文件元数据、校验值、创建时间 |
-| `GET /assets/uploads` | 查询本人仍在进行的分片上传会话，供刷新页面后恢复 | 无；API Key 自动限定到绑定业务 | `200`: `{items: [{uploadSessionId, idempotencyKey, fileName, businessId, path, sizeBytes, partSizeBytes, partCount, receivedParts, receivedBytes, status, expiresAt}]}` |
-| `POST /assets/uploads` | 创建分片上传会话并预留额度；`assets.upload` | `businessId`, `path`, `fileName`, `contentType`, `sizeBytes`, 可选 `idempotencyKey` | `201`: `uploadSessionId`, `idempotencyKey`, 分片大小/数量、会话状态和过期时间 |
+| `GET /assets/uploads` | 查询本人仍在进行或等待清理的分片上传会话，供刷新页面后恢复/查看清理状态 | 无；API Key 自动限定到绑定业务 | `200`: `{items: [{uploadSessionId, idempotencyKey, fileName, businessId, path, sizeBytes, partSizeBytes, partCount, receivedParts, receivedBytes, status, expiresAt}]}`；`cleanup_pending` 表示存储清理后会自动释放预留额度 |
+| `POST /assets/uploads` | 创建分片上传会话并预留额度；`assets.upload`；JSON 请求体最大 1 MiB | `businessId`, `path`, `fileName`, `contentType`, `sizeBytes`, 可选 `idempotencyKey` | `201`: `uploadSessionId`, `idempotencyKey`, 分片大小/数量、会话状态和过期时间；请求体过大返回 `413 upload_request_too_large` |
 | `PUT /assets/uploads/{uploadSessionId}/parts/{partNumber}` | 流式接收一个 32 MiB 以内的分片；`assets.upload` | `application/octet-stream` 原始分片内容，必须带 `Content-Length` | `200`: 更新后的会话进度 |
 | `GET /assets/uploads/{uploadSessionId}` | 查询上传会话和已收分片；`assets.upload` | 路径 ID | `200`: 分片号、已收字节、会话状态 |
 | `POST /assets/uploads/{uploadSessionId}/complete` | 校验并合并分片、登记素材、结算额度；`assets.upload` | 无 | `200`: 完成状态和 `asset` DTO |
-| `DELETE /assets/uploads/{uploadSessionId}` | 中止分片并释放预留额度；`assets.upload` | 路径 ID | `200`: cancelled 状态 |
+| `DELETE /assets/uploads/{uploadSessionId}` | 中止分片并释放预留额度；`assets.upload` | 路径 ID | `200`: cancelled 状态；`503 storage_unavailable`: 清理未完成，后台会重试且会话保留在上传任务中 |
 | `GET /assets` | 查询素材；`assets.read` | 人类会话可传 `businessId`；API Key 自动限定为绑定业务；另传 `includeDeleted`, `keyword`, 管理员可传 `workspaceId` / `ownerUserId`, 分页 | 分页素材 DTO |
 | `GET /assets/{assetId}` | 查询素材元数据；`assets.read` | 路径 ID | `200`: 素材 DTO，不含桶名/对象 key |
 | `GET /assets/{assetId}/content` | 签发 15 分钟预签名访问 URL；`assets.read` | 路径 ID | `302 Location` 指向对象公网域名 |

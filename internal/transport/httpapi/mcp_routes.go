@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -44,6 +45,8 @@ type jsonRPCError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
 }
+
+var errMCPFileTooLarge = errors.New("MCP small upload exceeds 7 MiB")
 
 type mcpToolDefinition struct {
 	Name        string         `json:"name"`
@@ -440,20 +443,12 @@ func executeMCPTool(ctx context.Context, name string, args map[string]any, mCtx 
 		if b64Content == "" {
 			return "错误: 必须提供 fileContentBase64 参数", true
 		}
-		if len(b64Content) > 10<<20 {
+		fileBytes, err := decodeMCPFileContent(b64Content)
+		if errors.Is(err, errMCPFileTooLarge) {
 			return "错误: 单次 MCP 上传仅支持不超过 7 MiB 的小文件，大文件请使用分片上传工具", true
 		}
-
-		// 兼容标准 Base64 及带有 data:image/png;base64, 前缀的数据
-		if idx := strings.Index(b64Content, ";base64,"); idx != -1 {
-			b64Content = b64Content[idx+8:]
-		}
-		fileBytes, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64Content))
 		if err != nil {
-			fileBytes, err = base64.RawStdEncoding.DecodeString(strings.TrimSpace(b64Content))
-			if err != nil {
-				return "错误: Base64 数据解码失败，请确认格式无误", true
-			}
+			return "错误: Base64 数据解码失败，请确认格式无误", true
 		}
 
 		fileHeader, err := bytesToMultipartFileHeader(fileBytes, fileName)
@@ -533,17 +528,17 @@ func executeMCPTool(ctx context.Context, name string, args map[string]any, mCtx 
 		if idx := strings.Index(raw, ";base64,"); idx >= 0 {
 			raw = raw[idx+8:]
 		}
-		decodedSize := int64(base64.StdEncoding.DecodedLen(len(raw)))
-		if strings.HasSuffix(raw, "==") {
-			decodedSize -= 2
-		} else if strings.HasSuffix(raw, "=") {
-			decodedSize--
-		}
-		if decodedSize <= 0 || decodedSize > 32*1024*1024 {
+		reader, partSize, err := prepareMCPPartContent(raw)
+		if errors.Is(err, errMCPPartTooLarge) {
 			return "错误: 单个分片内容必须大于 0 且不超过 32 MiB", true
 		}
-		reader := base64.NewDecoder(base64.StdEncoding, strings.NewReader(raw))
-		result, err := deps.Assets.UploadMultipartPart(ctx, mCtx.assetActor, assets.UploadPartInput{SessionID: getArgString(args, "uploadSessionId"), PartNumber: int(getArgNumber(args, "partNumber")), Reader: reader, ContentLength: decodedSize})
+		if err != nil {
+			return "错误: Base64 数据解码失败，请确认格式无误", true
+		}
+		if partSize == 0 {
+			return "错误: 单个分片内容必须大于 0 且不超过 32 MiB", true
+		}
+		result, err := deps.Assets.UploadMultipartPart(ctx, mCtx.assetActor, assets.UploadPartInput{SessionID: getArgString(args, "uploadSessionId"), PartNumber: int(getArgNumber(args, "partNumber")), Reader: reader, ContentLength: partSize})
 		if err != nil {
 			return fmt.Sprintf("上传分片失败: %v", err), true
 		}
@@ -759,4 +754,48 @@ func bytesToMultipartFileHeader(data []byte, filename string) (*multipart.FileHe
 		return nil, fmt.Errorf("构造文件头失败")
 	}
 	return files[0], nil
+}
+
+func decodeMCPFileContent(value string) ([]byte, error) {
+	if len(value) > 10<<20 {
+		return nil, errMCPFileTooLarge
+	}
+	if idx := strings.Index(value, ";base64,"); idx != -1 {
+		value = value[idx+8:]
+	}
+	value = strings.TrimSpace(value)
+	data, err := base64.StdEncoding.DecodeString(value)
+	if err != nil {
+		data, err = base64.RawStdEncoding.DecodeString(value)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(data) > 7<<20 {
+		return nil, errMCPFileTooLarge
+	}
+	return data, nil
+}
+
+var errMCPPartTooLarge = errors.New("MCP upload part exceeds 32 MiB")
+
+func prepareMCPPartContent(value string) (io.Reader, int64, error) {
+	if len(value) > 45<<20 {
+		return nil, 0, errMCPPartTooLarge
+	}
+	if idx := strings.Index(value, ";base64,"); idx >= 0 {
+		value = value[idx+8:]
+	}
+	value = strings.TrimSpace(value)
+	for _, encoding := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding} {
+		decoder := base64.NewDecoder(encoding, strings.NewReader(value))
+		size, err := io.Copy(io.Discard, io.LimitReader(decoder, (32<<20)+1))
+		if size > 32<<20 {
+			return nil, 0, errMCPPartTooLarge
+		}
+		if err == nil {
+			return base64.NewDecoder(encoding, strings.NewReader(value)), size, nil
+		}
+	}
+	return nil, 0, fmt.Errorf("invalid base64 content")
 }

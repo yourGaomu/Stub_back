@@ -120,7 +120,7 @@ func (s *Store) AbortMultipartForObject(ctx context.Context, bucket, key string)
 	}
 	for _, upload := range result.Uploads {
 		if upload.Key == key {
-			if err := s.core.AbortMultipartUpload(ctx, bucket, key, upload.UploadID); err != nil {
+			if err := s.AbortMultipart(ctx, bucket, key, upload.UploadID); err != nil {
 				return err
 			}
 		}
