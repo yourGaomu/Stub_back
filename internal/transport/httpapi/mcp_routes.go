@@ -234,20 +234,6 @@ func registerMCPRoutes(router *gin.Engine, deps Dependencies) {
 func mcpAuthenticate(service *auth.Service) gin.HandlerFunc {
 	baseAuth := authenticate(service)
 	return func(c *gin.Context) {
-		// 1. 如果请求头未带凭据，支持从 Query 提取（方便只支持标准 EventSource URL 的客户端）
-		if c.GetHeader("Authorization") == "" && c.GetHeader("X-API-Key") == "" {
-			token := strings.TrimSpace(c.Query("apiKey"))
-			if token == "" {
-				token = strings.TrimSpace(c.Query("token"))
-			}
-			if token != "" {
-				if strings.HasPrefix(token, "stub_sk_") {
-					c.Request.Header.Set("X-API-Key", token)
-				} else {
-					c.Request.Header.Set("Authorization", "Bearer "+token)
-				}
-			}
-		}
 		baseAuth(c)
 	}
 }
@@ -342,6 +328,9 @@ func executeMCPTool(ctx context.Context, name string, args map[string]any, mCtx 
 
 	switch name {
 	case "create_url_shortlink":
+		if err := requireMCPPermission(ctx, mCtx, deps, "links.create_url"); err != nil {
+			return err.Error(), true
+		}
 		rawURL := getArgString(args, "url")
 		if rawURL == "" {
 			return "错误: 必须提供 url 参数", true
@@ -395,6 +384,9 @@ func executeMCPTool(ctx context.Context, name string, args map[string]any, mCtx 
 			res.URL, res.Code, res.Target.URL, expireDesc, visitsDesc, formatPasswordDesc(pwd)), false
 
 	case "create_burn_link":
+		if err := requireMCPPermission(ctx, mCtx, deps, "links.create_url"); err != nil {
+			return err.Error(), true
+		}
 		rawURL := getArgString(args, "url")
 		if rawURL == "" {
 			return "错误: 必须提供 url 参数", true
@@ -434,6 +426,12 @@ func executeMCPTool(ctx context.Context, name string, args map[string]any, mCtx 
 			res.URL, res.Code, res.Target.URL, formatPasswordDesc(pwd)), false
 
 	case "upload_file_and_share":
+		if err := requireMCPAssetUpload(ctx, mCtx, deps); err != nil {
+			return err.Error(), true
+		}
+		if err := requireMCPPermission(ctx, mCtx, deps, "links.create_asset"); err != nil {
+			return err.Error(), true
+		}
 		fileName := getArgString(args, "fileName")
 		if fileName == "" {
 			return "错误: 必须提供 fileName 参数（如 report.pdf）", true
@@ -582,6 +580,9 @@ func executeMCPTool(ctx context.Context, name string, args map[string]any, mCtx 
 		return marshalMCPResult(result)
 
 	case "get_link_info":
+		if err := requireMCPPermission(ctx, mCtx, deps, "links.read"); err != nil {
+			return err.Error(), true
+		}
 		code := cleanCodeParam(getArgString(args, "code"))
 		if code == "" {
 			return "错误: 必须提供 code 参数", true
@@ -600,6 +601,9 @@ func executeMCPTool(ctx context.Context, name string, args map[string]any, mCtx 
 		return formatLinkDetail(list.Items[0]), false
 
 	case "list_my_links":
+		if err := requireMCPPermission(ctx, mCtx, deps, "links.read"); err != nil {
+			return err.Error(), true
+		}
 		pageSize := 10
 		if ps, ok := args["pageSize"].(float64); ok && int(ps) > 0 {
 			pageSize = int(ps)
@@ -657,21 +661,24 @@ func marshalMCPResult(value any) (string, bool) {
 }
 
 func requireMCPAssetUpload(ctx context.Context, mCtx mcpContext, deps Dependencies) error {
+	return requireMCPPermission(ctx, mCtx, deps, "assets.upload")
+}
+
+func requireMCPPermission(ctx context.Context, mCtx mcpContext, deps Dependencies, permission string) error {
 	if mCtx.assetActor.APIKeyID != nil {
-		if !mCtx.apiKeyScopes["assets.upload"] {
-			return fmt.Errorf("当前 API Key 没有 assets.upload 权限")
+		if !mCtx.apiKeyScopes[permission] {
+			return fmt.Errorf("当前 API Key 没有 %s 权限", permission)
 		}
-		return nil
 	}
 	if mCtx.assetActor.Role == "admin" {
 		return nil
 	}
 	var allowed bool
-	if err := deps.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM user_permissions WHERE user_id=$1 AND permission_code='assets.upload' AND granted_at IS NOT NULL AND revoked_at IS NULL)`, mCtx.assetActor.UserID).Scan(&allowed); err != nil {
-		return fmt.Errorf("检查素材上传权限失败")
+	if err := deps.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM user_permissions WHERE user_id=$1 AND permission_code=$2 AND granted_at IS NOT NULL AND revoked_at IS NULL)`, mCtx.assetActor.UserID, permission).Scan(&allowed); err != nil {
+		return fmt.Errorf("检查 %s 权限失败", permission)
 	}
 	if !allowed {
-		return fmt.Errorf("当前账号没有素材上传权限")
+		return fmt.Errorf("当前账号没有 %s 权限", permission)
 	}
 	return nil
 }

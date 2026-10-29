@@ -101,6 +101,8 @@ type UploadSessionDTO struct {
 	IdempotencyKey  string    `json:"idempotencyKey,omitempty"`
 	Status          string    `json:"status"`
 	FileName        string    `json:"fileName"`
+	BusinessID      string    `json:"businessId"`
+	Path            string    `json:"path"`
 	SizeBytes       int64     `json:"sizeBytes"`
 	PartSizeBytes   int64     `json:"partSizeBytes"`
 	PartCount       int       `json:"partCount"`

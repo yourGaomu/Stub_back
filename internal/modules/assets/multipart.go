@@ -255,7 +255,7 @@ func (s *Service) GetMultipartUpload(ctx context.Context, actor Actor, rawID str
 			}
 		}
 	}
-	result := UploadSessionDTO{UploadSessionID: publicID("upl", session.ID), IdempotencyKey: session.IdempotencyKey, Status: session.Status, FileName: session.FileName, SizeBytes: session.Size, PartSizeBytes: session.PartSize, PartCount: session.PartCount, ReceivedParts: parts, ReceivedBytes: received, ExpiresAt: session.ExpiresAt.UTC()}
+	result := UploadSessionDTO{UploadSessionID: publicID("upl", session.ID), IdempotencyKey: session.IdempotencyKey, Status: session.Status, FileName: session.FileName, BusinessID: session.BusinessID, Path: session.LogicalPath, SizeBytes: session.Size, PartSizeBytes: session.PartSize, PartCount: session.PartCount, ReceivedParts: parts, ReceivedBytes: received, ExpiresAt: session.ExpiresAt.UTC()}
 	if session.AssetID.Valid {
 		asset, err := s.Get(ctx, actor, publicID("ast", session.AssetID.UUID))
 		if err != nil {

@@ -2,6 +2,8 @@
 
 本文描述当前 Go 服务已注册的 HTTP 接口。所有管理 API 使用 `/api/v1` 前缀；除邮件验证码、注册、登录、密码重置与公开短链入口外，均使用人类 `Authorization: Bearer <accessToken>` 或机器 `X-API-Key: stub_sk_...`。机器 Key 也可放在 `Authorization: Bearer stub_sk_...` 中。人类 Token 最长 7 天，API Key 的状态、有效期、IP、频率、scope、业务授权和累计额度由服务端实时检查。
 
+MCP 使用 `POST /api/mcp`，凭据必须放在 `X-API-Key` 或 `Authorization` 请求头中，不支持 URL 查询参数传递凭据。
+
 成功列表统一返回 `{ "items": [], "pagination": { "page": 1, "pageSize": 20, "total": 0 } }`。错误统一返回 `{ "error": { "code": "...", "message": "...", "requestId": "..." } }`。时间为 RFC 3339 UTC；公开资源 ID 使用 `usr_`、`link_`、`tpl_`、`ast_` 等前缀。
 
 ## 认证与账户
@@ -120,7 +122,7 @@ API Key 相关错误还包括：`api_key_owner_permission_denied`（所属用户
 | --- | --- | --- | --- |
 | `GET /me/businesses` | 查询当前可访问业务 | 无 | `200`: `{items}` |
 | `POST /assets` | 上传单个素材；`assets.upload` 且必须获准访问业务 | 人类会话 multipart 必传 `businessId`；API Key 不传该字段，由服务端注入 Key 绑定业务；另传 `path`, `file` | `201`: `assetId`, 文件元数据、校验值、创建时间 |
-| `GET /assets/uploads` | 查询本人仍在进行的分片上传会话，供刷新页面后恢复 | 无；API Key 自动限定到绑定业务 | `200`: `{items: [{uploadSessionId, idempotencyKey, fileName, sizeBytes, partSizeBytes, partCount, receivedParts, receivedBytes, status, expiresAt}]}` |
+| `GET /assets/uploads` | 查询本人仍在进行的分片上传会话，供刷新页面后恢复 | 无；API Key 自动限定到绑定业务 | `200`: `{items: [{uploadSessionId, idempotencyKey, fileName, businessId, path, sizeBytes, partSizeBytes, partCount, receivedParts, receivedBytes, status, expiresAt}]}` |
 | `POST /assets/uploads` | 创建分片上传会话并预留额度；`assets.upload` | `businessId`, `path`, `fileName`, `contentType`, `sizeBytes`, 可选 `idempotencyKey` | `201`: `uploadSessionId`, `idempotencyKey`, 分片大小/数量、会话状态和过期时间 |
 | `PUT /assets/uploads/{uploadSessionId}/parts/{partNumber}` | 流式接收一个 32 MiB 以内的分片；`assets.upload` | `application/octet-stream` 原始分片内容，必须带 `Content-Length` | `200`: 更新后的会话进度 |
 | `GET /assets/uploads/{uploadSessionId}` | 查询上传会话和已收分片；`assets.upload` | 路径 ID | `200`: 分片号、已收字节、会话状态 |
