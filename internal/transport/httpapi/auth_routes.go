@@ -339,7 +339,7 @@ func parsePublicID(prefix, value string) (uuid.UUID, error) {
 }
 
 func writeServiceError(c *gin.Context, err error) {
-	// 1. 领域问题转换为稳定的 HTTP 契约；内部异常只记录请求 ID。
+	// 1. 领域问题转换为稳定的 HTTP 契约；内部错误详情仅写服务端日志，不返回给客户端。
 	var problem *auth.Problem
 	if errors.As(err, &problem) {
 		writeError(c, problem.Status, problem.Code, problem.Message)
@@ -372,7 +372,7 @@ func writeServiceError(c *gin.Context, err error) {
 	}
 	if logger, ok := c.Get("logger"); ok {
 		if value, ok := logger.(*slog.Logger); ok {
-			value.Error("request_failed", "request_id", requestID(c), "error_type", fmt.Sprintf("%T", err))
+			value.Error("request_failed", "request_id", requestID(c), "error_type", fmt.Sprintf("%T", err), "error", err.Error())
 		}
 	}
 	writeError(c, http.StatusInternalServerError, "internal_error", "服务内部错误")

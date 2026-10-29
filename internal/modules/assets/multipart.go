@@ -363,35 +363,42 @@ func (s *Service) CompleteMultipartUpload(ctx context.Context, actor Actor, rawI
 	now := time.Now().UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return UploadSessionDTO{}, err
+		return UploadSessionDTO{}, fmt.Errorf("complete multipart %s: begin transaction: %w", session.ID, err)
 	}
 	defer tx.Rollback()
 	var locked uploadSessionRecord
-	if err := s.scanUploadSession(tx.QueryRowContext(ctx, `SELECT upload_session_id,workspace_id,owner_user_id,business_id,api_key_id,bucket,object_key,minio_upload_id,original_name,content_type,logical_path,expected_size_bytes,part_size_bytes,part_count,reserved_bytes,status,expires_at,asset_id,COALESCE(idempotency_key,'') FROM asset_upload_sessions WHERE upload_session_id=$1 FOR UPDATE`), &locked); err != nil {
-		return UploadSessionDTO{}, err
+	// 2.1 锁定当前会话时必须传入 ID，确保查询占位符与参数对应。
+	if err := s.scanUploadSession(tx.QueryRowContext(ctx, `SELECT upload_session_id,workspace_id,owner_user_id,business_id,api_key_id,bucket,object_key,minio_upload_id,original_name,content_type,logical_path,expected_size_bytes,part_size_bytes,part_count,reserved_bytes,status,expires_at,asset_id,COALESCE(idempotency_key,'') FROM asset_upload_sessions WHERE upload_session_id=$1 FOR UPDATE`, session.ID), &locked); err != nil {
+		return UploadSessionDTO{}, fmt.Errorf("complete multipart %s: lock session: %w", session.ID, err)
 	}
 	if locked.Status == "completed" && locked.AssetID.Valid {
+		// 2.2 其他请求已完成时先释放事务，再查询素材，避免再次加锁等待自己。
+		tx.Rollback()
 		return s.GetMultipartUpload(ctx, actor, rawID)
 	}
 	if locked.Status != "completing" {
 		return UploadSessionDTO{}, problem(409, "upload_session_state_invalid", "上传会话状态已变化")
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO assets(asset_id,workspace_id,owner_user_id,business_id,logical_path,bucket,object_key,original_name,content_type,size_bytes,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, assetID, locked.WorkspaceID, locked.OwnerID, locked.BusinessID, locked.LogicalPath, locked.Bucket, locked.ObjectKey, locked.FileName, locked.ContentType, locked.Size, now); err != nil {
-		return UploadSessionDTO{}, err
+		return UploadSessionDTO{}, fmt.Errorf("complete multipart %s: insert asset: %w", session.ID, err)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE users SET storage_reserved_bytes=GREATEST(0,storage_reserved_bytes-$2),storage_used_bytes=storage_used_bytes+$2,updated_at=now() WHERE user_id=$1`, locked.OwnerID, locked.Reserved); err != nil {
-		return UploadSessionDTO{}, err
+		return UploadSessionDTO{}, fmt.Errorf("complete multipart %s: settle storage quota: %w", session.ID, err)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE asset_upload_sessions SET status='completed',asset_id=$2,api_quota_reserved=false,completed_at=$3,updated_at=$3 WHERE upload_session_id=$1`, locked.ID, assetID, now); err != nil {
-		return UploadSessionDTO{}, err
+		return UploadSessionDTO{}, fmt.Errorf("complete multipart %s: complete session: %w", session.ID, err)
 	}
 	if err := audit(ctx, tx, actor.UserID, locked.WorkspaceID, "asset.multipart_complete", assetID.String(), meta, map[string]any{"assetId": publicID("ast", assetID), "businessId": locked.BusinessID, "sizeBytes": locked.Size}); err != nil {
-		return UploadSessionDTO{}, err
+		return UploadSessionDTO{}, fmt.Errorf("complete multipart %s: write audit log: %w", session.ID, err)
 	}
 	if err := tx.Commit(); err != nil {
-		return UploadSessionDTO{}, err
+		return UploadSessionDTO{}, fmt.Errorf("complete multipart %s: commit transaction: %w", session.ID, err)
 	}
-	return s.GetMultipartUpload(ctx, actor, rawID)
+	result, err := s.GetMultipartUpload(ctx, actor, rawID)
+	if err != nil {
+		return UploadSessionDTO{}, fmt.Errorf("complete multipart %s: read completed asset: %w", session.ID, err)
+	}
+	return result, nil
 }
 
 func (s *Service) CancelMultipartUpload(ctx context.Context, actor Actor, rawID string) (UploadSessionDTO, error) {

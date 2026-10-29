@@ -276,7 +276,8 @@ func (s *Service) List(ctx context.Context, actor Actor, page, pageSize int, bus
 		return Page{}, err
 	}
 	args = append(args, pageSize, (page-1)*pageSize)
-	rows, err := s.db.QueryContext(ctx, `SELECT a.asset_id,a.business_id,a.logical_path,a.original_name,a.content_type,a.size_bytes,a.checksum_sha256,a.deleted_at,a.created_at FROM assets a WHERE `+filter+fmt.Sprintf(" ORDER BY a.created_at DESC LIMIT $%d OFFSET $%d", len(args)-1, len(args)), args...)
+	// 1.1 分片素材不计算整文件 SHA-256，数据库中的 NULL 按接口约定返回空字符串。
+	rows, err := s.db.QueryContext(ctx, `SELECT a.asset_id,a.business_id,a.logical_path,a.original_name,a.content_type,a.size_bytes,COALESCE(a.checksum_sha256,''),a.deleted_at,a.created_at FROM assets a WHERE `+filter+fmt.Sprintf(" ORDER BY a.created_at DESC LIMIT $%d OFFSET $%d", len(args)-1, len(args)), args...)
 	if err != nil {
 		return Page{}, err
 	}
@@ -567,7 +568,7 @@ func (s *Service) load(ctx context.Context, q interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, id uuid.UUID) (assetRecord, error) {
 	var r assetRecord
-	err := q.QueryRowContext(ctx, `SELECT asset_id,workspace_id,owner_user_id,business_id,bucket,object_key,logical_path,original_name,content_type,size_bytes,checksum_sha256,deleted_at,purged_at,created_at FROM assets WHERE asset_id=$1 FOR UPDATE`, id).Scan(&r.ID, &r.WorkspaceID, &r.OwnerID, &r.BusinessID, &r.Bucket, &r.ObjectKey, &r.Path, &r.Name, &r.ContentType, &r.Size, &r.Checksum, &r.DeletedAt, &r.PurgedAt, &r.CreatedAt)
+	err := q.QueryRowContext(ctx, `SELECT asset_id,workspace_id,owner_user_id,business_id,bucket,object_key,logical_path,original_name,content_type,size_bytes,COALESCE(checksum_sha256,''),deleted_at,purged_at,created_at FROM assets WHERE asset_id=$1 FOR UPDATE`, id).Scan(&r.ID, &r.WorkspaceID, &r.OwnerID, &r.BusinessID, &r.Bucket, &r.ObjectKey, &r.Path, &r.Name, &r.ContentType, &r.Size, &r.Checksum, &r.DeletedAt, &r.PurgedAt, &r.CreatedAt)
 	return r, err
 }
 
