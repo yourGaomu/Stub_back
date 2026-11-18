@@ -49,21 +49,22 @@ type jsonRPCError struct {
 var errMCPFileTooLarge = errors.New("MCP small upload exceeds 7 MiB")
 
 type mcpToolDefinition struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	InputSchema map[string]any `json:"inputSchema"`
+	Name         string         `json:"name"`
+	Description  string         `json:"description"`
+	InputSchema  map[string]any `json:"inputSchema"`
+	OutputSchema map[string]any `json:"outputSchema,omitempty"`
 }
 
 var mcpAvailableTools = []mcpToolDefinition{
 	{
 		Name:        "create_url_shortlink",
-		Description: "缩短普通网页长链接（HTTPS/HTTP）。支持设置有效天数、最大访问次数限制（-1 表示不限）和访问口令保护。",
+		Description: "缩短 HTTPS 网页链接。支持有效天数、最大访问次数（省略或 -1 表示不限，0 表示禁止访问）和访问口令。",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"url": map[string]any{
 					"type":        "string",
-					"description": "需要缩短的目标网页完整 URL（必须包含 http:// 或 https://）",
+					"description": "需要缩短的目标网页完整 HTTPS URL",
 				},
 				"title": map[string]any{
 					"type":        "string",
@@ -71,11 +72,14 @@ var mcpAvailableTools = []mcpToolDefinition{
 				},
 				"expireDays": map[string]any{
 					"type":        "integer",
+					"minimum":     int64(0),
+					"maximum":     int64((1<<63 - 1) / int64(24*time.Hour)),
 					"description": "有效期天数（可选），如 7 或 30，留空或 0 表示永久有效",
 				},
 				"maxVisits": map[string]any{
 					"type":        "integer",
-					"description": "最大允许访问次数（可选），-1 或留空表示不限制，填正整数表示达到次数后失效",
+					"minimum":     int64(-1),
+					"description": "最大访问次数：省略或 -1 表示不限，0 表示禁止访问，正整数表示达到次数后失效",
 				},
 				"password": map[string]any{
 					"type":        "string",
@@ -112,54 +116,70 @@ var mcpAvailableTools = []mcpToolDefinition{
 		},
 	},
 	{
-		Name:        "upload_file_and_share",
-		Description: "将不超过 7 MiB 的小文件内容（Base64 编码）上传至云端素材库并自动生成下载短链。大文件请使用分片上传工具。",
-		InputSchema: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"fileName": map[string]any{
-					"type":        "string",
-					"description": "包含后缀的文件名（如 report.pdf, output.png, test.txt）",
-				},
-				"fileContentBase64": map[string]any{
-					"type":        "string",
-					"description": "文件完整内容的 Base64 编码字符串",
-				},
-				"title": map[string]any{
-					"type":        "string",
-					"description": "短链展示标题（可选）",
-				},
-				"maxVisits": map[string]any{
-					"type":        "integer",
-					"description": "最大允许下载次数限制（可选），-1 或留空表示不限制",
-				},
-			},
-			"required": []string{"fileName", "fileContentBase64"},
-		},
+		Name:         "get_asset_info",
+		Description:  "查询当前授权业务内可用素材的元数据，不返回存储内部路径。需要 assets.read 权限。",
+		InputSchema:  mcpObjectSchema(map[string]any{"assetId": mcpPublicIDSchema("ast")}, "assetId"),
+		OutputSchema: mcpAssetSchema(),
 	},
 	{
-		Name: "begin_asset_upload", Description: "为文件内容创建分片上传会话并预留用户存储额度。随后用 upload_asset_part 逐片发送实际内容。",
-		InputSchema: map[string]any{"type": "object", "properties": map[string]any{
-			"fileName": map[string]any{"type": "string"}, "contentType": map[string]any{"type": "string"}, "sizeBytes": map[string]any{"type": "integer"}, "path": map[string]any{"type": "string"}, "businessId": map[string]any{"type": "string"}, "idempotencyKey": map[string]any{"type": "string"},
-		}, "required": []string{"fileName", "sizeBytes"}},
+		Name:         "get_asset_download_url",
+		Description:  "为当前授权业务内的可用素材签发 15 分钟下载地址，不消耗短链访问次数。需要 assets.read 权限。",
+		InputSchema:  mcpObjectSchema(map[string]any{"assetId": mcpPublicIDSchema("ast")}, "assetId"),
+		OutputSchema: mcpObjectSchema(map[string]any{"asset": mcpAssetSchema(), "downloadUrl": map[string]any{"type": "string", "format": "uri"}, "expiresAt": map[string]any{"type": "string", "format": "date-time"}}, "asset", "downloadUrl", "expiresAt"),
+	},
+	{
+		Name:        "create_asset_shortlink",
+		Description: "为已有可用素材创建下载短链，无需重新上传。需要 assets.read 和 links.create_asset 权限。maxVisits 默认 -1（不限），0 表示禁止访问。",
+		InputSchema: mcpObjectSchema(map[string]any{
+			"assetId": mcpPublicIDSchema("ast"), "title": map[string]any{"type": "string", "maxLength": 120},
+			"expiresAt": map[string]any{"type": "string", "format": "date-time", "description": "可选，晚于当前时间的 RFC3339 时间；省略表示永久有效"},
+			"maxVisits": map[string]any{"type": "integer", "minimum": int64(-1), "maximum": int64(1<<63 - 1), "default": int64(-1)},
+		}, "assetId"),
+		OutputSchema: mcpAssetShareSchema(),
+	},
+	{
+		Name:        "upload_file_and_share",
+		Description: "将不超过 7 MiB 的小文件内容（Base64 编码）上传至云端素材库并自动生成下载短链。大文件请使用分片上传工具。",
+		InputSchema: mcpObjectSchema(map[string]any{
+			"fileName":          map[string]any{"type": "string", "minLength": 1, "maxLength": 255},
+			"fileContentBase64": map[string]any{"type": "string", "minLength": 1, "maxLength": 10 << 20},
+			"title":             map[string]any{"type": "string", "maxLength": 120},
+			"maxVisits":         map[string]any{"type": "integer", "minimum": int64(-1), "maximum": int64(1<<63 - 1), "default": int64(-1), "description": "-1 表示不限，0 表示禁止访问"},
+		}, "fileName", "fileContentBase64"),
+		OutputSchema: mcpAssetShareSchema(),
+	},
+	{
+		Name: "begin_asset_upload", Description: "为文件内容创建分片上传会话并预留用户存储额度。API Key 固定在其绑定业务内；人类会话必须提供 businessId。",
+		InputSchema: mcpObjectSchema(map[string]any{
+			"fileName": map[string]any{"type": "string", "minLength": 1, "maxLength": 255}, "contentType": map[string]any{"type": "string"},
+			"sizeBytes": map[string]any{"type": "integer", "minimum": int64(1), "maximum": int64(32<<20) * 10000},
+			"path":      map[string]any{"type": "string", "default": "agent-uploads"}, "businessId": map[string]any{"type": "string", "minLength": 1},
+			"idempotencyKey": map[string]any{"type": "string", "maxLength": 128},
+		}, "fileName", "sizeBytes"),
+		OutputSchema: mcpUploadSessionSchema(),
 	},
 	{
 		Name: "upload_asset_part", Description: "上传一个分片的实际文件内容。contentBase64 仅是单个分片，不能传入本地路径或整个大文件。",
-		InputSchema: map[string]any{"type": "object", "properties": map[string]any{
-			"uploadSessionId": map[string]any{"type": "string"}, "partNumber": map[string]any{"type": "integer"}, "contentBase64": map[string]any{"type": "string"},
-		}, "required": []string{"uploadSessionId", "partNumber", "contentBase64"}},
+		InputSchema: mcpObjectSchema(map[string]any{
+			"uploadSessionId": mcpPublicIDSchema("upl"), "partNumber": map[string]any{"type": "integer", "minimum": 1, "maximum": 10000},
+			"contentBase64": map[string]any{"type": "string", "minLength": 1, "maxLength": 45 << 20},
+		}, "uploadSessionId", "partNumber", "contentBase64"),
+		OutputSchema: mcpUploadSessionSchema(),
 	},
 	{
-		Name: "get_asset_upload_status", Description: "查询分片上传已接收的分片、总进度和会话状态。",
-		InputSchema: map[string]any{"type": "object", "properties": map[string]any{"uploadSessionId": map[string]any{"type": "string"}}, "required": []string{"uploadSessionId"}},
+		Name: "get_asset_upload_status", Description: "查询分片上传已接收的分片、总进度和会话状态。需要 assets.upload 权限。",
+		InputSchema:  mcpObjectSchema(map[string]any{"uploadSessionId": mcpPublicIDSchema("upl")}, "uploadSessionId"),
+		OutputSchema: mcpUploadSessionSchema(),
 	},
 	{
 		Name: "complete_asset_upload", Description: "校验并合并全部分片，将预留额度结算为已用额度。",
-		InputSchema: map[string]any{"type": "object", "properties": map[string]any{"uploadSessionId": map[string]any{"type": "string"}}, "required": []string{"uploadSessionId"}},
+		InputSchema:  mcpObjectSchema(map[string]any{"uploadSessionId": mcpPublicIDSchema("upl")}, "uploadSessionId"),
+		OutputSchema: mcpUploadSessionSchema(),
 	},
 	{
 		Name: "cancel_asset_upload", Description: "取消未完成的分片上传，清理 MinIO 分片并释放预留额度。",
-		InputSchema: map[string]any{"type": "object", "properties": map[string]any{"uploadSessionId": map[string]any{"type": "string"}}, "required": []string{"uploadSessionId"}},
+		InputSchema:  mcpObjectSchema(map[string]any{"uploadSessionId": mcpPublicIDSchema("upl")}, "uploadSessionId"),
+		OutputSchema: mcpUploadSessionSchema(),
 	},
 	{
 		Name:        "get_link_info",
@@ -193,7 +213,7 @@ var mcpAvailableTools = []mcpToolDefinition{
 func registerMCPRoutes(router *gin.Engine, deps Dependencies) {
 	// 最新 MCP 官方规范：Streamable HTTP 单一端点（无状态、单次请求自闭环）
 	mcp := router.Group("/api/mcp")
-	mcp.Use(mcpAuthenticate(deps.Auth))
+	mcp.Use(mcpAuthenticate(deps.Auth), requireAPIKeyBusinessAccess(deps.DB))
 
 	mcp.POST("", func(c *gin.Context) {
 		bodyBytes, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, 48<<20))
@@ -292,7 +312,9 @@ func handleMCPMethod(ctx context.Context, req jsonRPCRequest, mCtx mcpContext, d
 			Name      string         `json:"name"`
 			Arguments map[string]any `json:"arguments"`
 		}
-		if err := json.Unmarshal(req.Params, &callParams); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(req.Params))
+		decoder.UseNumber()
+		if err := decoder.Decode(&callParams); err != nil {
 			return &jsonRPCResponse{
 				JSONRPC: "2.0",
 				ID:      req.ID,
@@ -300,20 +322,8 @@ func handleMCPMethod(ctx context.Context, req jsonRPCRequest, mCtx mcpContext, d
 			}
 		}
 
-		resultText, isErr := executeMCPTool(ctx, callParams.Name, callParams.Arguments, mCtx, deps)
-		return &jsonRPCResponse{
-			JSONRPC: "2.0",
-			ID:      req.ID,
-			Result: map[string]any{
-				"content": []map[string]any{
-					{
-						"type": "text",
-						"text": resultText,
-					},
-				},
-				"isError": isErr,
-			},
-		}
+		result := executeMCPTool(ctx, callParams.Name, callParams.Arguments, mCtx, deps)
+		return &jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: result}
 
 	default:
 		return &jsonRPCResponse{
@@ -324,7 +334,29 @@ func handleMCPMethod(ctx context.Context, req jsonRPCRequest, mCtx mcpContext, d
 	}
 }
 
-func executeMCPTool(ctx context.Context, name string, args map[string]any, mCtx mcpContext, deps Dependencies) (string, bool) {
+func executeMCPTool(ctx context.Context, name string, args map[string]any, mCtx mcpContext, deps Dependencies) mcpToolResult {
+	for _, tool := range mcpAvailableTools {
+		if tool.Name != name {
+			continue
+		}
+		if err := validateMCPArguments(args, tool.InputSchema); err != nil {
+			return mcpTextResult(err.Error(), true)
+		}
+		if tool.OutputSchema == nil {
+			text, isError := executeMCPTextTool(ctx, name, args, mCtx, deps)
+			return mcpTextResult(text, isError)
+		}
+		value, err := executeMCPAssetTool(ctx, name, args, mCtx, deps)
+		if err != nil {
+			return mcpTextResult(err.Error(), true)
+		}
+		return marshalMCPResult(value)
+	}
+	text, isError := executeMCPTextTool(ctx, name, args, mCtx, deps)
+	return mcpTextResult(text, isError)
+}
+
+func executeMCPTextTool(ctx context.Context, name string, args map[string]any, mCtx mcpContext, deps Dependencies) (string, bool) {
 	if args == nil {
 		args = make(map[string]any)
 	}
@@ -339,15 +371,26 @@ func executeMCPTool(ctx context.Context, name string, args map[string]any, mCtx 
 			return "错误: 必须提供 url 参数", true
 		}
 
-		var maxVisits int64 = -1
-		if mv, ok := args["maxVisits"].(float64); ok && int64(mv) > 0 {
-			maxVisits = int64(mv)
+		maxVisits := int64(-1)
+		if value, set := args["maxVisits"]; set {
+			limit, err := mcpInt64(value)
+			if err != nil || limit < -1 {
+				return "错误: maxVisits 必须为 -1、0 或正整数", true
+			}
+			maxVisits = limit
 		}
 
 		var expiresAt *time.Time
-		if days, ok := args["expireDays"].(float64); ok && days > 0 {
-			t := time.Now().Add(time.Duration(days*24) * time.Hour)
-			expiresAt = &t
+		if value, set := args["expireDays"]; set {
+			days, err := mcpInt64(value)
+			const maxExpireDays = int64((1<<63 - 1) / int64(24*time.Hour))
+			if err != nil || days < 0 || days > maxExpireDays {
+				return "错误: expireDays 必须为允许范围内的非负整数", true
+			}
+			if days > 0 {
+				expires := time.Now().UTC().Add(time.Duration(days) * 24 * time.Hour)
+				expiresAt = &expires
+			}
 		}
 
 		pwd := getArgString(args, "password")
@@ -361,7 +404,7 @@ func executeMCPTool(ctx context.Context, name string, args map[string]any, mCtx 
 				URL:  rawURL,
 			},
 			RuleSource: links.RuleSourceInput{
-				Type: "custom",
+				Type: "inline",
 				Rules: &links.RulesInput{
 					MaxVisits:       &maxVisits,
 					RequirePassword: pwd != "",
@@ -379,7 +422,9 @@ func executeMCPTool(ctx context.Context, name string, args map[string]any, mCtx 
 			expireDesc = res.ExpiresAt.Format("2006-01-02 15:04:05")
 		}
 		visitsDesc := "不限"
-		if res.Rules.MaxVisits > 0 {
+		if res.Rules.MaxVisits == 0 {
+			visitsDesc = "禁止访问"
+		} else if res.Rules.MaxVisits > 0 {
 			visitsDesc = fmt.Sprintf("最多 %d 次", res.Rules.MaxVisits)
 		}
 
@@ -412,7 +457,7 @@ func executeMCPTool(ctx context.Context, name string, args map[string]any, mCtx 
 				URL:  rawURL,
 			},
 			RuleSource: links.RuleSourceInput{
-				Type: "custom",
+				Type: "inline",
 				Rules: &links.RulesInput{
 					MaxVisits:       &maxVisits,
 					RequirePassword: pwd != "",
@@ -427,152 +472,6 @@ func executeMCPTool(ctx context.Context, name string, args map[string]any, mCtx 
 
 		return fmt.Sprintf("【阅后即焚】短链已创建成功！\n- 短链地址：%s\n- 短码：/r/%s\n- 目标地址：%s\n- 特性：仅限访问 1 次（被打开后立即永久销毁）\n- 有效期：24 小时自动到期\n- 口令保护：%s",
 			res.URL, res.Code, res.Target.URL, formatPasswordDesc(pwd)), false
-
-	case "upload_file_and_share":
-		if err := requireMCPAssetUpload(ctx, mCtx, deps); err != nil {
-			return err.Error(), true
-		}
-		if err := requireMCPPermission(ctx, mCtx, deps, "links.create_asset"); err != nil {
-			return err.Error(), true
-		}
-		fileName := getArgString(args, "fileName")
-		if fileName == "" {
-			return "错误: 必须提供 fileName 参数（如 report.pdf）", true
-		}
-		b64Content := getArgString(args, "fileContentBase64")
-		if b64Content == "" {
-			return "错误: 必须提供 fileContentBase64 参数", true
-		}
-		fileBytes, err := decodeMCPFileContent(b64Content)
-		if errors.Is(err, errMCPFileTooLarge) {
-			return "错误: 单次 MCP 上传仅支持不超过 7 MiB 的小文件，大文件请使用分片上传工具", true
-		}
-		if err != nil {
-			return "错误: Base64 数据解码失败，请确认格式无误", true
-		}
-
-		fileHeader, err := bytesToMultipartFileHeader(fileBytes, fileName)
-		if err != nil {
-			return fmt.Sprintf("构造上传文件头失败: %v", err), true
-		}
-
-		bizID := mCtx.assetActor.BusinessID
-		if bizID == "" {
-			bizID = "default"
-		}
-
-		assetRes, err := deps.Assets.Upload(ctx, mCtx.assetActor, assets.UploadInput{
-			BusinessID: bizID,
-			Path:       "agent-uploads",
-			File:       fileHeader,
-		}, mCtx.assetMeta)
-		if err != nil {
-			return fmt.Sprintf("素材上传失败: %v", err), true
-		}
-
-		var maxVisits int64 = -1
-		if mv, ok := args["maxVisits"].(float64); ok && int64(mv) > 0 {
-			maxVisits = int64(mv)
-		}
-
-		title := getArgString(args, "title")
-		if title == "" {
-			title = fileName
-		}
-
-		linkInput := links.CreateRequest{
-			Title: title,
-			Target: links.TargetInput{
-				Type:    "minio_asset",
-				AssetID: assetRes.AssetID,
-			},
-			RuleSource: links.RuleSourceInput{
-				Type: "custom",
-				Rules: &links.RulesInput{
-					MaxVisits: &maxVisits,
-				},
-			},
-		}
-
-		linkRes, err := deps.Links.Create(ctx, mCtx.actor, linkInput, mCtx.linkMeta)
-		if err != nil {
-			return fmt.Sprintf("素材已上传(ID: %s)，但创建直连短链失败: %v", assetRes.AssetID, err), true
-		}
-
-		return fmt.Sprintf("文件已成功上传至素材库并生成下载短链！\n- 文件名：%s (大小: %d 字节)\n- 短链直链：%s\n- 短码：/r/%s\n- 素材 ID：%s\n- 存储业务桶：%s",
-			fileName, len(fileBytes), linkRes.URL, linkRes.Code, assetRes.AssetID, assetRes.BusinessID), false
-
-	case "begin_asset_upload":
-		if err := requireMCPAssetUpload(ctx, mCtx, deps); err != nil {
-			return err.Error(), true
-		}
-		businessID := mCtx.assetActor.BusinessID
-		if businessID == "" {
-			businessID = getArgString(args, "businessId")
-		}
-		path := getArgString(args, "path")
-		if path == "" {
-			path = "agent-uploads"
-		}
-		result, err := deps.Assets.BeginMultipartUpload(ctx, mCtx.assetActor, assets.BeginUploadInput{BusinessID: businessID, Path: path, FileName: getArgString(args, "fileName"), ContentType: getArgString(args, "contentType"), SizeBytes: int64(getArgNumber(args, "sizeBytes")), IdempotencyKey: getArgString(args, "idempotencyKey")})
-		if err != nil {
-			return fmt.Sprintf("创建上传会话失败: %v", err), true
-		}
-		return marshalMCPResult(result)
-
-	case "upload_asset_part":
-		if err := requireMCPAssetUpload(ctx, mCtx, deps); err != nil {
-			return err.Error(), true
-		}
-		raw := strings.TrimSpace(getArgString(args, "contentBase64"))
-		if idx := strings.Index(raw, ";base64,"); idx >= 0 {
-			raw = raw[idx+8:]
-		}
-		reader, partSize, err := prepareMCPPartContent(raw)
-		if errors.Is(err, errMCPPartTooLarge) {
-			return "错误: 单个分片内容必须大于 0 且不超过 32 MiB", true
-		}
-		if err != nil {
-			return "错误: Base64 数据解码失败，请确认格式无误", true
-		}
-		if partSize == 0 {
-			return "错误: 单个分片内容必须大于 0 且不超过 32 MiB", true
-		}
-		result, err := deps.Assets.UploadMultipartPart(ctx, mCtx.assetActor, assets.UploadPartInput{SessionID: getArgString(args, "uploadSessionId"), PartNumber: int(getArgNumber(args, "partNumber")), Reader: reader, ContentLength: partSize})
-		if err != nil {
-			return fmt.Sprintf("上传分片失败: %v", err), true
-		}
-		return marshalMCPResult(result)
-
-	case "get_asset_upload_status":
-		if err := requireMCPAssetUpload(ctx, mCtx, deps); err != nil {
-			return err.Error(), true
-		}
-		result, err := deps.Assets.GetMultipartUpload(ctx, mCtx.assetActor, getArgString(args, "uploadSessionId"))
-		if err != nil {
-			return fmt.Sprintf("查询上传状态失败: %v", err), true
-		}
-		return marshalMCPResult(result)
-
-	case "complete_asset_upload":
-		if err := requireMCPAssetUpload(ctx, mCtx, deps); err != nil {
-			return err.Error(), true
-		}
-		result, err := deps.Assets.CompleteMultipartUpload(ctx, mCtx.assetActor, getArgString(args, "uploadSessionId"), mCtx.assetMeta)
-		if err != nil {
-			return fmt.Sprintf("完成上传失败: %v", err), true
-		}
-		return marshalMCPResult(result)
-
-	case "cancel_asset_upload":
-		if err := requireMCPAssetUpload(ctx, mCtx, deps); err != nil {
-			return err.Error(), true
-		}
-		result, err := deps.Assets.CancelMultipartUpload(ctx, mCtx.assetActor, getArgString(args, "uploadSessionId"))
-		if err != nil {
-			return fmt.Sprintf("取消上传失败: %v", err), true
-		}
-		return marshalMCPResult(result)
 
 	case "get_link_info":
 		if err := requireMCPPermission(ctx, mCtx, deps, "links.read"); err != nil {
@@ -600,11 +499,12 @@ func executeMCPTool(ctx context.Context, name string, args map[string]any, mCtx 
 			return err.Error(), true
 		}
 		pageSize := 10
-		if ps, ok := args["pageSize"].(float64); ok && int(ps) > 0 {
-			pageSize = int(ps)
-			if pageSize > 50 {
-				pageSize = 50
+		if value, set := args["pageSize"]; set {
+			size, err := mcpInt64(value)
+			if err != nil || size < 1 {
+				return "错误: pageSize 必须为正整数", true
 			}
+			pageSize = int(min(size, 50))
 		}
 
 		list, err := deps.Links.List(ctx, mCtx.actor, 1, pageSize, map[string]string{})
@@ -647,12 +547,14 @@ func getArgNumber(args map[string]any, key string) float64 {
 	return 0
 }
 
-func marshalMCPResult(value any) (string, bool) {
+func marshalMCPResult(value any) mcpToolResult {
 	encoded, err := json.Marshal(value)
 	if err != nil {
-		return fmt.Sprintf("序列化上传结果失败: %v", err), true
+		return mcpTextResult(fmt.Sprintf("序列化工具结果失败: %v", err), true)
 	}
-	return string(encoded), false
+	result := mcpTextResult(string(encoded), false)
+	result.StructuredContent = value
+	return result
 }
 
 func requireMCPAssetUpload(ctx context.Context, mCtx mcpContext, deps Dependencies) error {
