@@ -99,7 +99,7 @@ func (s *Service) BeginMultipartUpload(ctx context.Context, actor Actor, input B
 			if existingBusiness != input.BusinessID || existingPath != logicalPath || existingName != fileName || existingType != contentType || existingSize != input.SizeBytes {
 				return UploadSessionDTO{}, problem(409, "idempotency_conflict", "幂等键已用于其他上传参数")
 			}
-			return s.GetMultipartUpload(ctx, actor, existing)
+			return s.GetMultipartUpload(ctx, actor, "upl_"+existing)
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
 			return UploadSessionDTO{}, err
