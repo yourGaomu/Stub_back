@@ -27,6 +27,8 @@ MCP 使用 `POST /api/mcp`，凭据必须放在 `X-API-Key` 或 `Authorization` 
 
 验证码、邀请码明文和访问 Token 不会写入日志或数据库明文字段。登录失败、注册、邀请码核销、密码重置、会话创建与撤销均写入长期审计；审计保留来源 IP、客户端标识或必要的业务结果字段。密码重置成功后所有旧会话立即失效。
 
+验证码比较失败时，在同一事务内递增 `attempt_count` 并提交后返回 `422 invalid_or_expired_verification_code`；每条验证码最多五次错误比较。无可用验证码或次数已达上限同样返回 422。正确码的消费与注册账号/空间/权限/邀请码核销，或密码更新/撤销会话/审计写入共同提交；业务失败时全部回滚。
+
 ## 管理员
 
 管理员接口需有效 Bearer Token 且 `role=admin`；管理员拥有所有普通用户功能权限。
@@ -73,15 +75,15 @@ API Key 相关错误还包括：`api_key_owner_permission_denied`（所属用户
 
 ## 短链
 
-普通用户必须具有相应 `links.*` 权限；资源范围始终从登录用户工作空间确定。短链目标创建后不可更改。第一阶段暂不实现批量创建；提醒功能安排在后续开发。
+普通用户必须具有相应 `links.*` 权限。普通用户资源范围由登录用户工作空间确定。短链目标创建后固定。
 
 | 方法与路径 | 作用 | 请求 | 成功响应 |
 | --- | --- | --- | --- |
-| `POST /links` | 创建 HTTPS URL 或素材短链 | 可选 `title`, `tags`, `code`；`target`, `expiresAt`, `accessPassword`, `ruleSource` | `201`: 稳定 `linkId`、`title`、`tags`、`code`、`url`、目标、规则及模板版本 |
-| `GET /links` | 查询可见短链 | `workspaceId`, `status`, `availability`, `targetType`, `code`, `keyword`, `assetId`, 创建时间筛选、分页 | 分页短链摘要，含标题和标签 |
-| `GET /links/{linkId}` | 查询详情 | 路径 `linkId` | `200`: 短链 DTO |
-| `PATCH /links/{linkId}/metadata` | 修改标题和标签 | `title`, `tags` | `200`: 更新后的短链 DTO |
-| `PATCH /links/{linkId}/rules` | 修改到期时间、次数、IP 范围和口令规则 | 任一规则字段；`expiresAt:null` 表示清除到期时间 | `200`: 更新后的短链 DTO |
+| `POST /links` | 创建 HTTPS URL 或素材短链 | 可选 `title`, `tags`, `code`, `expiresAt`, `activeFrom`, `activeUntil`, `accessPassword`；必传 `target`, `ruleSource` | `201`，包括稳定 `linkId`、短码、规则及开放窗口 |
+| `GET /links` | 查询可见短链 | `workspaceId`, `status`, `availability`, `targetType`, `code`, `keyword`, `assetId`, `maxVisits`, 创建时间筛选、分页 | 分页短链摘要，包括开放窗口 |
+| `GET /links/{linkId}` | 查询详情 | 路径 `linkId` | `200` 短链 DTO，包括开放窗口 |
+| `PATCH /links/{linkId}/metadata` | 修改标题、标签或分组 | `title`, `tags`, `groupId` | `200` 更新后的短链 DTO |
+| `PATCH /links/{linkId}/rules` | 修改有效期、开放窗口、次数、IP 范围和口令规则 | 部分更新，时间字段可传 `null` 清除 | `200` 更新后的短链 DTO |
 | `POST /links/{linkId}/renew` | 续期并可选择保留或轮换短码 | `expiresAt`, `codeStrategy` | `200`: 当前 `linkId`, `code`, URL, `codeChanged` |
 | `POST /links/{linkId}/rotate-code` | 仅轮换短码 | `strategy`, 自定义策略时传 `code` | `200`: 新码、新 URL |
 | `POST /links/{linkId}/reset-visits` | 重置访问次数 | 无 | `200`: `visitsUsed=0`, `maxVisits`, `resetAt` |
@@ -90,11 +92,63 @@ API Key 相关错误还包括：`api_key_owner_permission_denied`（所属用户
 | `GET /r/{code}` | 匿名解析短链，规则通过后 302 | 路径短码 | HTML 挑战/错误页或 `302 Location` |
 | `POST /r/{code}/password` | 提交访问口令；口令错误不消耗访问次数 | 表单 `password` | HTML 错误页或 `302 Location` |
 
-标题为可选字段，最多 120 个字符；标签可选，最多 20 个，每个最多 32 个字符。服务端会去除标签首尾空格，并按不区分大小写的方式去重。`keyword` 对标题、标签、短码和 HTTPS 目标 URL 执行不区分大小写的包含查询；`assetId` 为精确筛选。
+标题为可选字段，最多 120 个字符；标签可选，最多 20 个，每个最多 32 个字符。服务端会去除标签首尾空格，并按不区分大小写的方式去重。`keyword` 对标题、标签、短码和 HTTPS 目标 URL 执行不区分大小写的包含查询；`assetId` 为精确筛选。`maxVisits` 精确匹配规则上限，接受 `-1`、`0` 或 int64 范围内的正整数；省略时不筛选，空值、非整数、低于 -1 或溢出返回 `422 invalid_filter`。列表固定按 `created_at DESC, link_id DESC` 排序。
 
-两个 `PATCH` 接口都要求 `links.manage`，并且只能操作本人工作空间内的短链。元数据请求必须同时提供 `title` 和 `tags`，允许传空字符串或空数组清空；规则请求可部分更新。规则修改保留 `LinkId`、目标、短码、累计访问次数及创建时记录的模板 ID/版本，规则仍以短链自身快照为准；每次修改写入审计日志，不记录口令明文。启用口令时可不传 `accessPassword` 以保留现有口令；从未启用状态改为启用时必须提供新口令。访问次数规则修改不会重置 `visitsUsed`。
+两个 `PATCH` 接口都要求 `links.manage`。普通用户只能操作本人工作空间内的短链。元数据中的 `title` 和 `tags` 必须成对提供，允许用空字符串和空数组清空。规则 PATCH 支持部分更新，保留目标、短码、访问计数及原模板 ID 和版本。审计记录规则变化及窗口前后值，口令不写入审计。从关闭口令改为开启时必须提供新口令，已开启时省略 `accessPassword` 会保留旧口令。修改最大次数会开启新的提醒周期，访问计数仍保留。
 
-创建接口 `ruleSource` 只能选择 `{ "type": "inline", "rules": ... }` 或 `{ "type": "template", "template": { "templateId": "...", "version": 1 } }`。`maxVisits` 缺省为 `-1`，`0` 禁止访问。访问日志以短链服务实际收到的放行尝试为准，不推断 302 后的下载结果。
+创建接口 `ruleSource` 只能选择 `{ "type": "inline", "rules": ... }` 或 `{ "type": "template", "template": { "templateId": "...", "version": 1 } }`。`maxVisits` 缺省为 `-1`，`0` 禁止访问。创建或更新访问口令时长度须为 1 至 1024 字节，且不能全为空白。
+
+`activeFrom`、`activeUntil` 和 `expiresAt` 接受带时区的 RFC3339 字符串，按 PostgreSQL 微秒精度保存，返回 UTC 时间或 `null`。开放区间含起点、不含终点。实际截止取 `expiresAt` 与 `activeUntil` 中较早的非空值。开始必须严格早于实际截止。创建或主动填写新的结束、到期时间时，值必须晚于当前时间。开始可以是过去时间。
+
+规则 PATCH 对时间字段有三种操作。省略保持原值，`null` 清除边界，传时间字符串替换。未修改的历史结束时间不会阻止其它规则编辑。续期只改变 `expiresAt`，保留 `activeUntil`。例如 `{"activeFrom":"2026-12-12T09:00:00+08:00","activeUntil":"2026-12-12T18:00:00+08:00"}` 表示在同一天北京时间 09:00 起开放，到 18:00 停止。若 17:00 已到期，则在 17:00 停止。
+
+列表、详情和 CSV 中的可用性按 `disabled` → `expired` → `window_ended` → `not_started` → `visit_limit_reached` → `available` 判定。`GET /links` 和短链 CSV 均接受这六种 `availability` 值。业务到期和窗口结束都已过去时，返回 `expired`。CSV 列结构保持兼容，开放起止时间从列表和详情 JSON 读取。
+
+`visitsUsed` 仅在有效 `302 Location` 准备成功后递增，并与 `result=allowed`、`consumesVisit=true` 的日志同事务提交。短链行锁与锁后短码校验保护访问额度。公开入口先检查短码撤销，再检查可用性和 IP，最后才显示或验证口令。`not_started`、次数耗尽、IP 拒绝返回 403。短码撤销、停用、到期、`window_ended` 返回 410。窗口拒绝不写口令尝试状态，访问日志记录对应原因且不扣次。素材不可用时记录 `asset_unavailable` 并返回 503。签发的素材地址按独立期限有效。计数记录服务端放行，客户端最终打开或下载结果不在这一口径内。
+
+此计数口径从升级后的新请求生效；已有 `visits_used`、历史日志的 `consumes_visit` 不回填、不重算，也不会自动重置。需要重置时仍由具备权限的用户显式调用 `reset-visits`，并保留审计。
+
+## 短链分组
+
+分组归工作空间所有，不改变短链的访问规则或 API Key 业务范围。集合与维护接口仅支持人类会话；普通用户固定默认空间，管理员默认也使用默认空间，只有显式 `workspaceId` 才跨空间读取/创建。每空间最多 50 个分组，名称去首尾空格、1–120 字符、大小写不敏感唯一，描述最多 1000 字符。
+
+| 方法与路径 | 权限与请求 | 成功响应 |
+| --- | --- | --- |
+| `GET /link-groups` | `links.read`；分页，管理员可传 `workspaceId` | 分页 GroupDTO：`groupId`, `workspaceId`, `name`, `description`, `linkCount`, `createdAt`, `updatedAt` |
+| `POST /link-groups` | `links.manage`；`name`，可选 `description`, 管理员 `workspaceId` | `201` GroupDTO |
+| `PATCH /link-groups/{groupId}` | `links.manage`；至少一个 `name`/`description` | `200` GroupDTO |
+| `DELETE /link-groups/{groupId}` | `links.manage` | `200`：`groupId`, `unlinkedCount`, `deleted=true`，仅解除关联 |
+
+短链创建可传 `groupId`，列表可传 `groupId` 或 `ungrouped=true`（互斥）；省略两者为全部。详情/列表返回 `groupId`、`groupName`，未分组时为 null。元数据 PATCH 的 `title` 和 `tags` 仍须成对，另允许独立 `groupId`：省略保持、null 清空、字符串移入。服务端按短链最终工作空间校验分组，跨空间返回 404；数据库复合外键兜底。删除分组、移组及组信息变化均记录审计，短链/素材/访问日志保留。
+
+## CSV 导出
+
+只接受人类会话，不支持 API Key。`GET /links/export.csv` 需要 `links.read`，复用短链列表筛选（忽略分页）；`GET /logs/access/export.csv` 与 `GET /logs/audit/export.csv` 需要 `logs.read_own`，复用相应日志筛选。访问日志额外支持 `groupId`/`ungrouped=true`，按短链当前分组查询历史事件，不是历史分组快照。
+
+单次最多 10000 条、20 MiB，日志范围最多 90 天（缺省最近 30 天）；超过返回 422，不静默截断。每用户每小时最多 10 次生成、同时 1 个，超限返回 429，`Retry-After` 提示重试。生成超时为 60 秒，失败/取消清理临时文件。临时 CSV 完整生成且审计成功后才发送 attachment；生成失败仍为统一 JSON 错误，传输中断不能保证客户端收到完整文件。
+
+格式 UTF-8 BOM、CRLF、标准 CSV 转义、公式前缀保护，时间 UTC RFC3339；响应 `Cache-Control: no-store`、`X-Content-Type-Options: nosniff`。短链 CSV 列：`linkId,code,url,title,tags,targetType,assetId,assetSizeBytes,groupId,groupName,status,availability,visitsUsed,maxVisits,expiresAt,createdAt`。不导出原始目标 URL、密码/哈希、Token、验证码或预签名地址。访问日志列为 `event_id,link_id,accessed_at_utc,source_ip,user_agent,result,reason,consumes_visit,request_id`；审计列为 `event_id,actor_type,actor_id,action,resource_type,resource_id,occurred_at_utc,source_ip,result,details_json,request_id`，details 仍经过白名单。
+
+导出开始/生成成功或失败记录审计，只记录类型、筛选键、行数/大小和耗时，不记录 CSV 内容。日志范围沿用现有访问创建者、审计本人/空间/邮箱范围，不因导出放宽。
+
+## 站内通知与提醒
+
+以下接口仅接受人类 Bearer 会话。通知按当前登录用户隔离，管理员也只读取自己的收件箱。API Key 返回 `403 api_key_forbidden_endpoint`。响应使用 `Cache-Control: no-store`。
+
+| 方法与路径 | 请求 | 成功响应 |
+| --- | --- | --- |
+| `GET /notifications` | 可选 `unread=true` 只列未读。`page` 默认 1，`pageSize` 默认 20、最大 100 | `200`，`{items,pagination}`，按创建时间与通知 ID 倒序 |
+| `GET /notifications/unread-count` | 无 | `200`，`{unreadCount}` |
+| `PATCH /notifications/{notificationId}/read` | 稳定 `ntf_UUID`，无请求体 | `204`，重复请求保留首次已读时间 |
+| `POST /notifications/read-all` | 无 | `200`，`{markedCount}` 为本次标记数量 |
+| `GET /me/notification-settings` | 无 | `200`，`{expiryEnabled,visitsEnabled}`，默认两项均开启 |
+| `PATCH /me/notification-settings` | `expiryEnabled` 或 `visitsEnabled` 布尔值，至少提供一项 | `200`，更新后的两项偏好 |
+
+通知包含 `notificationId`、`workspaceId`、`linkId`、`kind`、`title`、`summary`、UTC `createdAt` 和 `readAt`。已删除短链的 `linkId` 可为 `null`，未读通知的 `readAt` 为 `null`。通知不存在或不属于本人时均返回 `404 notification_not_found`。
+
+- `expiry_24h` 针对启用且尚未到达实际截止的短链。距离实际截止大于 0 且不超过 24 小时时可生成。同一短链在同一实际截止时刻最多生成一次。
+- `visits_80` 针对启用且最大次数大于 0 的短链，阈值为最大次数的 80% 向上取整。达到或超过阈值均符合条件。每个计数周期最多生成一次，清零或修改最大次数会开启新周期。
+- 后台启动时执行一轮，随后每分钟扫描，优先处理近期截止的短链。单轮最多检查 200 个候选、生成 100 条，超时 30 秒。生成前复核时间、短链和偏好。竞争中的候选可跳过，下一轮仍符合条件时再尝试；积压时不保证在截止前送达。关闭偏好保留历史，重新开启可补发当前仍满足条件且从未生成的提醒。首版只向站内收件箱写入，接收人为短链创建者。
 
 ## 规则模板
 
@@ -137,5 +191,14 @@ API Key 相关错误还包括：`api_key_owner_permission_denied`（所属用户
 | `GET /logs/audit` | 查询操作审计；`logs.read_own` | `workspaceId`, `actorUserId`, `businessId`, `resourceType`, `resourceId`, `action`, `result`, `from`, `to`, 分页 | 分页审计事件 |
 | `GET /analytics/summary` | 查询用户或工作空间统计；`links.read` | `range=24h\|7d\|30d`, `timeZone`, 管理员可传 `workspaceId` | 汇总、失败原因、时间序列 |
 | `GET /analytics/links/{linkId}` | 查询单条短链统计；`links.read` | `range`, `timeZone` | 同上 |
+
+统计的 `totals` 与每个时间桶使用相同口径：
+
+- `requestCount`：短链访问日志总数，含挑战与口令尝试。
+- `visitAttemptCount`：`event_type='link_access' AND result!='challenge'`，含所有主链路放行及规则/目标不可用拒绝；不依赖 `consumes_visit`，不含口令挑战与 `password_attempt`。
+- `redirectCount`：`event_type='link_access' AND result='allowed' AND reason IS NULL`，表示服务端放行，不表示后续下载完成。
+- `failureCount`：仅 `result='denied'`，包括口令错误/冷却；挑战不计为失败。失败原因分布也只汇总 denied。
+
+CORS 来源通过 `CORS_ALLOWED_ORIGINS` 显式配置，具体默认值与原生应用来源示例见 README。非 development 环境为空时拒绝跨域请求（403），无 Origin 和同源请求仍正常处理。
 
 素材删除任务每分钟后台扫描到期记录；只有 MinIO 确认对象删除后才释放额度。`/healthz` 表示进程存活，`/readyz` 同时检查已配置的 PostgreSQL、Redis 与 MinIO 依赖。

@@ -18,7 +18,17 @@ func registerLogRoutes(router *gin.Engine, deps Dependencies) {
 		if !ok {
 			return
 		}
+		ungrouped := false
+		if raw, present := c.GetQuery("ungrouped"); present {
+			value, err := strconv.ParseBool(raw)
+			if err != nil {
+				writeError(c, http.StatusUnprocessableEntity, "invalid_filter", "ungrouped 参数无效")
+				return
+			}
+			ungrouped = value
+		}
 		result, err := service.Access(c.Request.Context(), logActor(c), logs.AccessFilter{
+			GroupID: c.Query("groupId"), Ungrouped: ungrouped,
 			LinkID: c.Query("linkId"), From: c.Query("from"), To: c.Query("to"), Result: c.Query("result"), Reason: c.Query("reason"),
 			WorkspaceID: c.Query("workspaceId"), BusinessID: c.Query("businessId"), LinkOwnerUserID: c.Query("linkOwnerUserId"), Page: page, PageSize: pageSize,
 		})

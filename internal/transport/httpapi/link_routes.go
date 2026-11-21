@@ -100,8 +100,11 @@ func registerLinkRoutes(router *gin.Engine, deps Dependencies) {
 			return
 		}
 		filters := map[string]string{}
-		for _, key := range []string{"workspaceId", "status", "availability", "targetType", "code", "keyword", "assetId", "createdFrom", "createdTo"} {
-			filters[key] = c.Query(key)
+		query := c.Request.URL.Query()
+		for _, key := range []string{"workspaceId", "status", "availability", "targetType", "code", "keyword", "assetId", "groupId", "ungrouped", "maxVisits", "createdFrom", "createdTo"} {
+			if query.Has(key) {
+				filters[key] = query.Get(key)
+			}
 		}
 		result, err := service.List(c.Request.Context(), linkActor(c), page, pageSize, filters)
 		if err != nil {

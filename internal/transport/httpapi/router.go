@@ -49,13 +49,23 @@ func NewRouter(deps Dependencies) (*gin.Engine, error) {
 		return nil, err
 	}
 	router.Use(gin.Recovery(), requestContext(deps.Logger))
-	router.Use(cors.New(cors.Config{
-		AllowOrigins:     append(deps.Config.CORSAllowedOrigins, "https://localhost:5174", "http://localhost"),
+	origins, err := config.NormalizeCORSOrigins(deps.Config.CORSAllowedOrigins)
+	if err != nil {
+		return nil, err
+	}
+	corsConfig := cors.Config{
+		AllowOrigins:     origins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Authorization", "Content-Type", "X-API-Key", "X-Client-App", "X-Request-ID"},
 		ExposeHeaders:    []string{"X-Request-ID"},
 		AllowCredentials: true,
-	}))
+		CustomSchemas:    []string{"capacitor://"},
+	}
+	// 2.1. cors v1.7.3 不接受空列表；显式拒绝函数使空配置安全地拒绝跨域。
+	if len(origins) == 0 {
+		corsConfig.AllowOriginFunc = func(string) bool { return false }
+	}
+	router.Use(cors.New(corsConfig))
 
 	// 3. 区分进程存活和依赖就绪，供容器探针分别使用。
 	router.GET("/healthz", func(c *gin.Context) {
@@ -82,10 +92,13 @@ func NewRouter(deps Dependencies) (*gin.Engine, error) {
 	registerAuthRoutes(router, deps.Auth, deps.DB)
 	registerAPIKeyRoutes(router, deps.Auth, deps.DB)
 	registerLinkRoutes(router, deps)
+	registerLinkGroupRoutes(router, deps)
+	registerExportRoutes(router, deps)
 	registerTemplateRoutes(router, deps)
 	registerBusinessRoutes(router, deps)
 	registerAssetRoutes(router, deps)
 	registerLogRoutes(router, deps)
+	registerNotificationRoutes(router, deps)
 	registerMCPRoutes(router, deps)
 	return router, nil
 }

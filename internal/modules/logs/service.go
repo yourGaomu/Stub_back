@@ -51,6 +51,8 @@ type AccessFilter struct {
 	Reason          string
 	WorkspaceID     string
 	BusinessID      string
+	GroupID         string
+	Ungrouped       bool
 	LinkOwnerUserID string
 	Page            int
 	PageSize        int
@@ -158,11 +160,8 @@ func (s *Service) Access(ctx context.Context, actor Actor, filter AccessFilter) 
 	if err != nil {
 		return Page[AccessEvent]{}, err
 	}
-	if !validAccessResult(filter.Result) || len(filter.Reason) > 40 || len(filter.BusinessID) > 64 {
-		return Page[AccessEvent]{}, problem(422, "invalid_filter", "日志筛选参数无效")
-	}
-	if actor.Role != "admin" && (filter.WorkspaceID != "" || filter.BusinessID != "" || filter.LinkOwnerUserID != "") {
-		return Page[AccessEvent]{}, problem(422, "invalid_filter", "普通用户不能指定管理员筛选范围")
+	if err := validateAccessFilter(actor, filter); err != nil {
+		return Page[AccessEvent]{}, err
 	}
 
 	// 2. 用参数化条件组合列表和总数查询，避免筛选值进入 SQL 文本。
@@ -210,11 +209,8 @@ func (s *Service) Audit(ctx context.Context, actor Actor, filter AuditFilter) (P
 	if err != nil {
 		return Page[AuditEvent]{}, err
 	}
-	if !validAuditResult(filter.Result) || len(filter.Action) > 80 || len(filter.ResourceType) > 40 || len(filter.ResourceID) > 128 || len(filter.BusinessID) > 64 {
-		return Page[AuditEvent]{}, problem(422, "invalid_filter", "日志筛选参数无效")
-	}
-	if actor.Role != "admin" && (filter.WorkspaceID != "" || filter.ActorUserID != "" || filter.BusinessID != "") {
-		return Page[AuditEvent]{}, problem(422, "invalid_filter", "普通用户不能指定管理员筛选范围")
+	if err := validateAuditFilter(actor, filter); err != nil {
+		return Page[AuditEvent]{}, err
 	}
 
 	// 2. 使用固定白名单字段生成 SQL 谓词，并以稳定资源 ID 返回审计数据。
@@ -409,7 +405,7 @@ func (s *Service) analytics(ctx context.Context, actor Actor, rawLinkID, rangeNa
 	}
 	filter := strings.Join(where, " AND ")
 	var totals Metric
-	query := `SELECT count(*),count(*) FILTER(WHERE l.consumes_visit),count(*) FILTER(WHERE l.event_type='link_access' AND l.result='allowed' AND l.reason IS NULL),count(*) FILTER(WHERE l.result='denied') FROM short_link_access_logs l JOIN short_links sl ON sl.link_id=l.link_id WHERE ` + filter
+	query := `SELECT count(*),count(*) FILTER(WHERE l.event_type='link_access' AND l.result!='challenge'),count(*) FILTER(WHERE l.event_type='link_access' AND l.result='allowed' AND l.reason IS NULL),count(*) FILTER(WHERE l.result='denied') FROM short_link_access_logs l JOIN short_links sl ON sl.link_id=l.link_id WHERE ` + filter
 	if err := s.db.QueryRowContext(ctx, query, args...).Scan(&totals.RequestCount, &totals.VisitAttemptCount, &totals.RedirectCount, &totals.FailureCount); err != nil {
 		return Analytics{}, err
 	}
@@ -443,7 +439,7 @@ func (s *Service) analytics(ctx context.Context, actor Actor, rawLinkID, rangeNa
 		bucketExpression = fmt.Sprintf(`date_trunc('day',l.accessed_at AT TIME ZONE $%d) AT TIME ZONE $%d`, tzIndex, tzIndex)
 		bucketArgs = append(bucketArgs, timeZone)
 	}
-	bucketQuery := `SELECT ` + bucketExpression + `,count(*),count(*) FILTER(WHERE l.consumes_visit),count(*) FILTER(WHERE l.event_type='link_access' AND l.result='allowed' AND l.reason IS NULL),count(*) FILTER(WHERE l.result='denied') FROM short_link_access_logs l JOIN short_links sl ON sl.link_id=l.link_id WHERE ` + filter + fmt.Sprintf(" GROUP BY 1 ORDER BY 1")
+	bucketQuery := `SELECT ` + bucketExpression + `,count(*),count(*) FILTER(WHERE l.event_type='link_access' AND l.result!='challenge'),count(*) FILTER(WHERE l.event_type='link_access' AND l.result='allowed' AND l.reason IS NULL),count(*) FILTER(WHERE l.result='denied') FROM short_link_access_logs l JOIN short_links sl ON sl.link_id=l.link_id WHERE ` + filter + fmt.Sprintf(" GROUP BY 1 ORDER BY 1")
 	rows, err := s.db.QueryContext(ctx, bucketQuery, bucketArgs...)
 	if err != nil {
 		return Analytics{}, err
@@ -517,6 +513,18 @@ func accessWhere(actor Actor, filter AccessFilter, from, to time.Time) (string, 
 			return "", nil, problem(422, "invalid_filter", "短链 ID 无效")
 		}
 		add("l.link_id=$%d", id)
+	}
+	if filter.GroupID != "" && filter.Ungrouped {
+		return "", nil, problem(422, "invalid_filter", "groupId 与 ungrouped 不能同时提供")
+	}
+	if filter.GroupID != "" {
+		id, err := parseID("grp", filter.GroupID)
+		if err != nil {
+			return "", nil, problem(422, "invalid_filter", "分组 ID 无效")
+		}
+		add("sl.group_id=$%d", id)
+	} else if filter.Ungrouped {
+		where = append(where, "sl.group_id IS NULL")
 	}
 	if filter.BusinessID != "" {
 		add("l.business_id=$%d", filter.BusinessID)
@@ -628,10 +636,14 @@ func nullableString(value sql.NullString) *string {
 func safeDetails(raw []byte) map[string]any {
 	// 1. 仅返回方案规定的白名单业务元数据，不把任意 JSON 或凭据带出数据库。
 	allowed := map[string]bool{
-		"assetId": true, "businessId": true, "path": true, "fileName": true, "contentType": true, "sizeBytes": true, "checksumSha256": true,
+		"groupId": true, "groupIdBefore": true, "groupIdAfter": true, "groupName": true, "groupNameBefore": true, "groupNameAfter": true, "unlinkedCount": true,
+		"exportKind": true, "rowCount": true, "sizeBytes": true, "filterKeys": true, "durationMs": true,
+		"assetId": true, "businessId": true, "path": true, "fileName": true, "contentType": true, "checksumSha256": true,
 		"permissionCode": true, "enabled": true, "revokedByPermission": true, "inviteId": true, "createdByUserId": true, "redeemedByUserId": true, "invitedByUserId": true, "targetUserId": true, "assignedRole": true, "boundEmail": true, "role": true, "registeredViaInvite": true, "templateId": true, "templateVersion": true, "version": true,
 		"targetType": true, "code": true, "oldCode": true, "codeChanged": true, "codeStrategy": true, "strategy": true,
 		"expiresAt": true, "expiresAtBefore": true, "expiresAtAfter": true,
+		"activeFrom": true, "activeFromBefore": true, "activeFromAfter": true,
+		"activeUntil": true, "activeUntilBefore": true, "activeUntilAfter": true,
 		"title": true, "titleBefore": true, "titleAfter": true, "tags": true, "tagsBefore": true, "tagsAfter": true,
 		"allowedIpCidrsBefore": true, "allowedIpCidrsAfter": true, "wrongPasswordStrategyBefore": true, "wrongPasswordStrategyAfter": true,
 		"maxVisits": true, "maxVisitsBefore": true, "maxVisitsAfter": true, "requirePassword": true, "requirePasswordBefore": true, "requirePasswordAfter": true,
@@ -662,7 +674,7 @@ func publicResourceID(kind string, raw sql.NullString) *string {
 	if !raw.Valid {
 		return nil
 	}
-	prefix := map[string]string{"short_link": "link", "rule_template": "tpl", "asset": "ast", "user": "usr", "session": "ses", "invite": "inv"}[kind]
+	prefix := map[string]string{"short_link": "link", "link_group": "grp", "rule_template": "tpl", "asset": "ast", "user": "usr", "session": "ses", "invite": "inv"}[kind]
 	if prefix != "" {
 		if id, err := uuid.Parse(raw.String); err == nil {
 			value := publicID(prefix, id)
@@ -674,9 +686,9 @@ func publicResourceID(kind string, raw sql.NullString) *string {
 
 func internalResourceID(kind, value string) (string, error) {
 	// 1. 对外接受带类型前缀的 ID，数据库筛选仍使用内部 UUID 字符串。
-	prefix := map[string]string{"short_link": "link", "rule_template": "tpl", "asset": "ast", "user": "usr", "session": "ses", "invite": "inv"}[kind]
+	prefix := map[string]string{"short_link": "link", "link_group": "grp", "rule_template": "tpl", "asset": "ast", "user": "usr", "session": "ses", "invite": "inv"}[kind]
 	if prefix == "" {
-		for _, candidate := range []string{"link", "tpl", "ast", "usr", "ses", "inv"} {
+		for _, candidate := range []string{"link", "grp", "tpl", "ast", "usr", "ses", "inv"} {
 			if strings.HasPrefix(value, candidate+"_") {
 				prefix = candidate
 				break
