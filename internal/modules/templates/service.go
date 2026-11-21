@@ -164,7 +164,7 @@ func (s *Service) List(ctx context.Context, actor Actor, page, pageSize int, wor
 	args = append(args, pageSize, (page-1)*pageSize)
 	query := `SELECT t.template_id,t.workspace_id,t.name,t.status,t.latest_version,
 		(SELECT count(*) FROM short_links sl WHERE sl.template_id=t.template_id),t.updated_at
-		FROM rule_templates t WHERE ` + filter + fmt.Sprintf(" ORDER BY t.updated_at DESC LIMIT $%d OFFSET $%d", len(args)-1, len(args))
+		FROM rule_templates t WHERE ` + filter + fmt.Sprintf(" ORDER BY t.updated_at DESC,t.template_id DESC LIMIT $%d OFFSET $%d", len(args)-1, len(args))
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return Page{}, err

@@ -15,23 +15,25 @@ import (
 	"github.com/yourGaomu/short_links/back/internal/platform/envfile"
 )
 
-func main() {
+func main() { os.Exit(run()) }
+
+func run() int {
 	// 1. 读取并校验运行配置，避免服务带着不完整配置启动。
 	if err := envfile.LoadForDevelopment(); err != nil {
 		slog.Error("加载环境文件失败", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	cfg, err := config.Load()
 	if err != nil {
 		slog.Error("配置校验失败", "error", err)
-		os.Exit(1)
+		return 1
 	}
 
 	// 2. 创建服务依赖并完成迁移、基础数据初始化。
 	application, err := app.New(context.Background(), cfg)
 	if err != nil {
 		slog.Error("服务初始化失败", "error", err)
-		os.Exit(1)
+		return 1
 	}
 	defer application.Close()
 
@@ -57,7 +59,7 @@ func main() {
 	case err := <-serverErrors:
 		if !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("HTTP 服务异常退出", "error", err)
-			os.Exit(1)
+			return 1
 		}
 	case <-stop.Done():
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -66,4 +68,5 @@ func main() {
 			slog.Error("HTTP 服务优雅退出失败", "error", err)
 		}
 	}
+	return 0
 }

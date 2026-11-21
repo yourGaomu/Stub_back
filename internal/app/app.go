@@ -17,6 +17,7 @@ import (
 	"github.com/yourGaomu/short_links/back/internal/modules/business"
 	"github.com/yourGaomu/short_links/back/internal/modules/links"
 	"github.com/yourGaomu/short_links/back/internal/modules/logs"
+	"github.com/yourGaomu/short_links/back/internal/modules/notifications"
 	"github.com/yourGaomu/short_links/back/internal/modules/templates"
 	"github.com/yourGaomu/short_links/back/internal/platform/objectstore"
 	"github.com/yourGaomu/short_links/back/internal/platform/postgres"
@@ -25,13 +26,15 @@ import (
 )
 
 type App struct {
-	db          *sql.DB
-	redis       *redis.Client
-	objectStore *objectstore.Store
-	logger      *slog.Logger
-	router      *gin.Engine
-	cleanerStop context.CancelFunc
-	cleanerWG   sync.WaitGroup
+	db               *sql.DB
+	redis            *redis.Client
+	objectStore      *objectstore.Store
+	logger           *slog.Logger
+	router           *gin.Engine
+	cleanerStop      context.CancelFunc
+	cleanerWG        sync.WaitGroup
+	notificationStop context.CancelFunc
+	notificationWG   sync.WaitGroup
 }
 
 func New(ctx context.Context, cfg config.Config) (*App, error) {
@@ -76,6 +79,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	templateService := templates.NewService(db)
 	businessService := business.NewService(db, store)
 	logService := logs.NewService(db)
+	notificationService := notifications.NewService(db)
 
 	// 7. 将领域服务和基础设施依赖注入 HTTP 路由，避免路由层自行组装业务对象。
 	router, err := httpapi.NewRouter(httpapi.Dependencies{
@@ -102,6 +106,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	}
 	application.router = router
 	application.startAssetCleaner(assetService)
+	application.startNotificationWorker(ctx, notificationService.RunOnce)
 	return application, nil
 }
 
@@ -109,10 +114,14 @@ func (a *App) Router() *gin.Engine { return a.router }
 
 func (a *App) Close() {
 	// 1. 先停止后台任务并等待其释放数据库/对象存储连接。
+	if a.notificationStop != nil {
+		a.notificationStop()
+	}
 	if a.cleanerStop != nil {
 		a.cleanerStop()
-		a.cleanerWG.Wait()
 	}
+	a.notificationWG.Wait()
+	a.cleanerWG.Wait()
 	// 2. 按依赖生命周期逆序释放连接。
 	if a.objectStore != nil {
 		a.objectStore.Close()
@@ -123,6 +132,33 @@ func (a *App) Close() {
 	if a.db != nil {
 		_ = a.db.Close()
 	}
+}
+
+func (a *App) startNotificationWorker(parent context.Context, scan func(context.Context, int) error) {
+	ctx, cancel := context.WithCancel(parent)
+	a.notificationStop = cancel
+	a.notificationWG.Add(1)
+	go func() {
+		defer a.notificationWG.Done()
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			workCtx, workCancel := context.WithTimeout(ctx, 30*time.Second)
+			err := scan(workCtx, 100)
+			workCancel()
+			if err != nil && ctx.Err() == nil {
+				a.logger.Error("notification_scan_failed", "error", err)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
 }
 
 func (a *App) startAssetCleaner(service *assets.Service) {

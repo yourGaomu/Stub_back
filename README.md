@@ -46,6 +46,18 @@ docker compose --env-file .env up -d --no-build
 
 首期无需 Kafka：数据库事务承载需要强一致的账号、短链、额度和访问记录；Redis 已覆盖当前短期限流场景；MinIO 负责大对象。只有后续出现独立异步消费、削峰或跨服务事件订阅需求并达到实际吞吐量时，再引入消息队列。
 
+## 跨域来源配置
+
+`CORS_ALLOWED_ORIGINS` 为精确 Origin 的逗号分隔列表，不含路径、查询或通配符。只有 `APP_ENV=development` 且来源为空时默认使用 `http://localhost:5173,http://localhost:5174`；生产和其它环境为空表示不允许跨域，仍允许无 Origin 的服务端请求及同源请求。
+
+跨域 Web 需显式配置其页面来源，例如 `https://console.example.com`。Capacitor Android 常见来源为 `https://localhost`，iOS 常见来源为 `capacitor://localhost`，如实际请求需要跨域许可应显式加入；原生 HTTP 桥接是否发送 Origin 需真机确认。生产不再隐式加入任何 localhost 来源。CORS 不能替代 Bearer/API Key 认证。
+
+## 回归验证
+
+在后端目录运行 `go test ./...` 和 `go vet ./...`；工具链运行时支持时运行 `go test -race ./...`。真实 PostgreSQL 并发用例需显式设置专用 `TEST_DATABASE_URL`，使用随机独立 schema，测试完成后删除该 schema；不读取 `.env`，也不回退到 `DATABASE_URL`。未提供测试连接时明确跳过。
+
+访问计数修复只对升级后的请求生效：拒绝和素材不可用不扣次，准备有效 302 且事务提交后才算一次放行。历史计数/日志不回填、不自动重置；预签名 URL 后续访问不由短链次数控制。详见 [API 文档](docs/API.md)。
+
 ## 主要接口域
 
 详见 [`docs/API.md`](docs/API.md)，包括各接口的请求与响应 DTO、权限和状态变化。

@@ -125,9 +125,15 @@ func (s *Service) Register(ctx context.Context, input RegisterRequest, meta Audi
 		return User{}, fmt.Errorf("开始注册事务失败: %w", err)
 	}
 	defer tx.Rollback()
-	verificationID, err := s.validateEmailCode(ctx, tx, email, "register", input.VerificationCode)
+	verificationID, valid, err := s.validateEmailCode(ctx, tx, email, "register", input.VerificationCode)
 	if err != nil {
 		return User{}, err
+	}
+	if !valid {
+		if err := tx.Commit(); err != nil {
+			return User{}, fmt.Errorf("提交验证码校验失败: %w", err)
+		}
+		return User{}, problem(422, "invalid_or_expired_verification_code", "验证码无效或已过期")
 	}
 	var registrationLock any
 	if err := tx.QueryRowContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, email).Scan(&registrationLock); err != nil {
@@ -461,9 +467,15 @@ func (s *Service) PasswordReset(ctx context.Context, input PasswordResetRequest,
 		return err
 	}
 	defer tx.Rollback()
-	verificationID, err := s.validateEmailCode(ctx, tx, email, "password_reset", input.VerificationCode)
+	verificationID, valid, err := s.validateEmailCode(ctx, tx, email, "password_reset", input.VerificationCode)
 	if err != nil {
 		return err
+	}
+	if !valid {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("提交验证码校验失败: %w", err)
+		}
+		return problem(422, "invalid_or_expired_verification_code", "验证码无效或已过期")
 	}
 	now := time.Now().UTC()
 	if _, err := tx.ExecContext(ctx, `UPDATE users SET password_hash = $2, updated_at = $3 WHERE user_id = $1`, userID, hash, now); err != nil {
@@ -481,8 +493,8 @@ func (s *Service) PasswordReset(ctx context.Context, input PasswordResetRequest,
 	return tx.Commit()
 }
 
-func (s *Service) validateEmailCode(ctx context.Context, tx *sql.Tx, email, purpose, code string) (uuid.UUID, error) {
-	// 1. 锁定最近的有效验证码，并限制每条验证码最多五次比较。
+func (s *Service) validateEmailCode(ctx context.Context, tx *sql.Tx, email, purpose, code string) (uuid.UUID, bool, error) {
+	// 1. 只在调用方事务内锁定并比较验证码；事务提交或回滚由业务入口负责。
 	var id uuid.UUID
 	var digest string
 	var attempts int
@@ -490,24 +502,23 @@ func (s *Service) validateEmailCode(ctx context.Context, tx *sql.Tx, email, purp
 		SELECT verification_id, code_hash, attempt_count FROM email_verification_codes
 		WHERE email = $1 AND purpose = $2 AND delivery_status = 'sent' AND consumed_at IS NULL AND expires_at > now()
 		ORDER BY created_at DESC LIMIT 1 FOR UPDATE`, email, purpose).Scan(&id, &digest, &attempts)
-	if errors.Is(err, sql.ErrNoRows) || attempts >= 5 {
-		return uuid.Nil, problem(422, "invalid_or_expired_verification_code", "验证码无效或已过期")
+	if errors.Is(err, sql.ErrNoRows) {
+		return uuid.Nil, false, nil
 	}
 	if err != nil {
-		return uuid.Nil, err
+		return uuid.Nil, false, err
+	}
+	if attempts >= 5 {
+		return uuid.Nil, false, nil
 	}
 	provided := s.emailCodeDigest(email, purpose, code)
 	if !hmac.Equal([]byte(digest), []byte(provided)) {
-		_, updateErr := tx.ExecContext(ctx, `UPDATE email_verification_codes SET attempt_count = attempt_count + 1 WHERE verification_id = $1`, id)
-		if updateErr != nil {
-			return uuid.Nil, updateErr
+		if _, err := tx.ExecContext(ctx, `UPDATE email_verification_codes SET attempt_count = attempt_count + 1 WHERE verification_id = $1`, id); err != nil {
+			return uuid.Nil, false, err
 		}
-		if err := tx.Commit(); err != nil {
-			return uuid.Nil, err
-		}
-		return uuid.Nil, problem(422, "invalid_or_expired_verification_code", "验证码无效或已过期")
+		return uuid.Nil, false, nil
 	}
-	return id, nil
+	return id, true, nil
 }
 
 type lockedInvite struct {

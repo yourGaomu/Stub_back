@@ -57,11 +57,17 @@ func Load() (Config, error) {
 		MinIOPublicEndpoint:   strings.TrimRight(strings.TrimSpace(os.Getenv("MINIO_PUBLIC_ENDPOINT")), "/"),
 		MinIOAccessKey:        os.Getenv("MINIO_ACCESS_KEY"),
 		MinIOSecretKey:        os.Getenv("MINIO_SECRET_KEY"),
-		CORSAllowedOrigins:    splitCSV(getEnv("CORS_ALLOWED_ORIGINS", "http://localhost:5173")),
+		CORSAllowedOrigins:    splitCSV(os.Getenv("CORS_ALLOWED_ORIGINS")),
 		TrustedProxyCIDRs:     splitCSV(os.Getenv("TRUSTED_PROXY_CIDRS")),
 	}
 
 	var err error
+	if len(cfg.CORSAllowedOrigins) == 0 && cfg.Environment == "development" {
+		cfg.CORSAllowedOrigins = []string{"http://localhost:5173", "http://localhost:5174"}
+	}
+	if cfg.CORSAllowedOrigins, err = NormalizeCORSOrigins(cfg.CORSAllowedOrigins); err != nil {
+		return Config{}, err
+	}
 	if cfg.SMTPPort, err = getInt("SMTP_PORT", 587); err != nil {
 		return Config{}, err
 	}
@@ -150,6 +156,39 @@ func splitCSV(value string) []string {
 		}
 	}
 	return result
+}
+
+// NormalizeCORSOrigins 仅接受完整、无路径的显式来源；空列表表示拒绝跨域。
+func NormalizeCORSOrigins(origins []string) ([]string, error) {
+	result := make([]string, 0, len(origins))
+	seen := make(map[string]bool, len(origins))
+	for _, raw := range origins {
+		origin := strings.TrimSpace(raw)
+		if origin == "" {
+			continue
+		}
+		parsed, err := url.Parse(origin)
+		if err != nil || parsed.Host == "" || parsed.Hostname() == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || strings.ContainsAny(origin, "*?#\\") {
+			return nil, fmt.Errorf("CORS_ALLOWED_ORIGINS 包含无效来源 %q", origin)
+		}
+		if parsed.Scheme != "http" && parsed.Scheme != "https" && origin != "capacitor://localhost" {
+			return nil, fmt.Errorf("CORS_ALLOWED_ORIGINS 包含不支持的来源 %q", origin)
+		}
+		if port := parsed.Port(); port != "" {
+			value, err := strconv.Atoi(port)
+			if err != nil || value < 1 || value > 65535 {
+				return nil, fmt.Errorf("CORS_ALLOWED_ORIGINS 包含无效端口 %q", origin)
+			}
+		} else if strings.HasSuffix(parsed.Host, ":") {
+			return nil, fmt.Errorf("CORS_ALLOWED_ORIGINS 包含无效端口 %q", origin)
+		}
+		origin = strings.ToLower(origin)
+		if !seen[origin] {
+			result = append(result, origin)
+			seen[origin] = true
+		}
+	}
+	return result, nil
 }
 
 func validateURL(name, raw string) error {

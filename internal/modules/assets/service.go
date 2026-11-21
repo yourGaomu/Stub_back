@@ -299,7 +299,7 @@ func (s *Service) List(ctx context.Context, actor Actor, page, pageSize int, bus
 	}
 	args = append(args, pageSize, (page-1)*pageSize)
 	// 1.1 分片素材不计算整文件 SHA-256，数据库中的 NULL 按接口约定返回空字符串。
-	rows, err := s.db.QueryContext(ctx, `SELECT a.asset_id,a.business_id,a.logical_path,a.original_name,a.content_type,a.size_bytes,COALESCE(a.checksum_sha256,''),a.deleted_at,a.created_at FROM assets a WHERE `+filter+fmt.Sprintf(" ORDER BY a.created_at DESC LIMIT $%d OFFSET $%d", len(args)-1, len(args)), args...)
+	rows, err := s.db.QueryContext(ctx, `SELECT a.asset_id,a.business_id,a.logical_path,a.original_name,a.content_type,a.size_bytes,COALESCE(a.checksum_sha256,''),a.deleted_at,a.created_at FROM assets a WHERE `+filter+fmt.Sprintf(" ORDER BY a.created_at DESC,a.asset_id DESC LIMIT $%d OFFSET $%d", len(args)-1, len(args)), args...)
 	if err != nil {
 		return Page{}, err
 	}

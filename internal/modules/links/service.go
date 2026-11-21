@@ -28,10 +28,15 @@ const accessLogWindow = time.Minute
 
 var codePattern = regexp.MustCompile(`^[a-z0-9-]{4,64}$`)
 
+type presignedGetter interface {
+	PresignedGet(context.Context, string, string, time.Duration, string, string) (string, error)
+}
+
 type Service struct {
-	db    *sql.DB
-	cfg   config.Config
-	store *objectstore.Store
+	db        *sql.DB
+	cfg       config.Config
+	store     presignedGetter
+	accessNow func() time.Time
 }
 
 type Actor struct {
@@ -55,6 +60,8 @@ type linkRecord struct {
 	Title           string
 	BusinessID      string
 	Tags            []string
+	GroupID         sql.NullString
+	GroupName       sql.NullString
 	TargetType      string
 	TargetURL       sql.NullString
 	AssetID         sql.NullString
@@ -64,6 +71,8 @@ type linkRecord struct {
 	OriginalName    sql.NullString
 	ContentType     sql.NullString
 	ExpiresAt       sql.NullTime
+	ActiveFrom      sql.NullTime
+	ActiveUntil     sql.NullTime
 	MaxVisits       int64
 	VisitsUsed      int64
 	IPCIDRs         string
@@ -80,7 +89,12 @@ type linkRecord struct {
 }
 
 func NewService(db *sql.DB, cfg config.Config, store *objectstore.Store) *Service {
-	return &Service{db: db, cfg: cfg, store: store}
+	service := &Service{db: db, cfg: cfg, accessNow: time.Now}
+	// 1. 未配置的具体指针不转入接口，避免 typed nil 被当作可用签名器。
+	if store != nil {
+		service.store = store
+	}
+	return service
 }
 
 func (s *Service) Create(ctx context.Context, actor Actor, input CreateRequest, meta RequestMeta) (CreateResponse, error) {
@@ -105,9 +119,20 @@ func (s *Service) Create(ctx context.Context, actor Actor, input CreateRequest, 
 	} else if input.Target.URL != "" || input.Target.AssetID == "" {
 		return CreateResponse{}, problem(422, "invalid_target", "素材目标必须提供 assetId 且不能提供 URL")
 	}
-	if input.ExpiresAt != nil && !input.ExpiresAt.After(time.Now()) {
+	now := time.Now().UTC()
+	expiresAt, activeFrom, activeUntil := nullTime(input.ExpiresAt), nullTime(input.ActiveFrom), nullTime(input.ActiveUntil)
+	if expiresAt.Valid && !expiresAt.Time.After(now) {
 		return CreateResponse{}, problem(422, "invalid_expiration", "到期时间必须晚于当前时间")
 	}
+	if activeUntil.Valid && !activeUntil.Time.After(now) {
+		return CreateResponse{}, problem(422, "invalid_window", "开放结束时间必须晚于当前时间")
+	}
+	if err := validateWindow(activeFrom, activeUntil, expiresAt); err != nil {
+		return CreateResponse{}, err
+	}
+	input.ExpiresAt = timePointer(expiresAt)
+	input.ActiveFrom = timePointer(activeFrom)
+	input.ActiveUntil = timePointer(activeUntil)
 
 	// 2. 解析内联规则或固定到创建时版本的模板规则。
 	rules, templateRef, err := s.resolveRules(ctx, actor, input.RuleSource)
@@ -119,6 +144,9 @@ func (s *Service) Create(ctx context.Context, actor Actor, input CreateRequest, 
 	}
 	if rules.RequirePassword && strings.TrimSpace(input.AccessPassword) == "" {
 		return CreateResponse{}, problem(422, "access_password_required", "启用访问口令时必须提供口令")
+	}
+	if rules.RequirePassword && !validAccessPassword(input.AccessPassword) {
+		return CreateResponse{}, problem(422, "invalid_access_password", "访问口令必须为 1 至 1024 字节且不能全为空白")
 	}
 	if !rules.RequirePassword && input.AccessPassword != "" {
 		return CreateResponse{}, problem(422, "unexpected_access_password", "未启用访问口令时不能提供口令")
@@ -134,15 +162,29 @@ func (s *Service) Create(ctx context.Context, actor Actor, input CreateRequest, 
 		policyJSON, _ = json.Marshal(rules.WrongPasswordPolicy)
 	}
 
-	// 3. 使用事务锁住用户额度行，串行校验额度、素材归属并创建短链及短码。
+	var groupID *uuid.UUID
+	if input.GroupID != nil {
+		parsed, err := parseID("grp", *input.GroupID)
+		if err != nil {
+			return CreateResponse{}, problem(404, "group_not_found", "分组不存在或无权访问")
+		}
+		groupID = &parsed
+	}
+
+	// 3. Membership locks precede user/link row locks in every writer.
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return CreateResponse{}, err
 	}
 	defer tx.Rollback()
+	if groupID != nil {
+		if err := lockGroupMembership(ctx, tx, *groupID, false); err != nil {
+			return CreateResponse{}, err
+		}
+	}
 	var urlQuota, assetLinkQuota int
 	var role string
-	if err := tx.QueryRowContext(ctx, `SELECT role, url_link_quota, minio_asset_link_quota FROM users WHERE user_id=$1 FOR UPDATE`, actor.UserID).
+	if err := tx.QueryRowContext(ctx, `SELECT role, url_link_quota, minio_asset_link_quota FROM users WHERE user_id=$1 FOR NO KEY UPDATE`, actor.UserID).
 		Scan(&role, &urlQuota, &assetLinkQuota); err != nil {
 		return CreateResponse{}, fmt.Errorf("读取短链创建额度失败: %w", err)
 	}
@@ -229,13 +271,22 @@ func (s *Service) Create(ctx context.Context, actor Actor, input CreateRequest, 
 			return CreateResponse{}, err
 		}
 	}
+	var groupName sql.NullString
+	var responseGroupID, responseGroupName *string
+	if groupID != nil {
+		groupName, err = validateLinkGroup(ctx, tx, *groupID, workspaceID)
+		if err != nil {
+			return CreateResponse{}, err
+		}
+		responseGroupID, responseGroupName = publicGroupFields(sql.NullString{String: groupID.String(), Valid: true}, groupName)
+	}
 	linkID := uuid.New()
 	tagsJSON, _ := json.Marshal(tags)
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO short_links (link_id,workspace_id,business_id,title,tags,target_type,target_url,asset_id,expires_at,max_visits,allowed_ip_cidrs,require_password,password_hash,wrong_password_policy,status,template_id,template_version,created_by)
-		VALUES ($1,$2,NULLIF($3,''),$4,$5::jsonb,$6,NULLIF($7,''),$8,$9,$10,$11::cidr[],$12,$13,$14::jsonb,'enabled',$15,$16,$17)`,
+		INSERT INTO short_links (link_id,workspace_id,business_id,title,tags,target_type,target_url,asset_id,expires_at,max_visits,allowed_ip_cidrs,require_password,password_hash,wrong_password_policy,status,template_id,template_version,created_by,group_id,active_from,active_until)
+		VALUES ($1,$2,NULLIF($3,''),$4,$5::jsonb,$6,NULLIF($7,''),$8,$9,$10,$11::cidr[],$12,$13,$14::jsonb,'enabled',$15,$16,$17,$18,$19,$20)`,
 		linkID, workspaceID, assetBusinessID, title, string(tagsJSON), input.Target.Type, input.Target.URL, assetID, input.ExpiresAt, rules.MaxVisits,
-		cidrArray(rules.AllowedIPCIDRs), rules.RequirePassword, passwordHash, nullableJSON(policyJSON), nullableTemplateID(templateRef), nullableTemplateVersion(templateRef), actor.UserID)
+		cidrArray(rules.AllowedIPCIDRs), rules.RequirePassword, passwordHash, nullableJSON(policyJSON), nullableTemplateID(templateRef), nullableTemplateVersion(templateRef), actor.UserID, groupID, input.ActiveFrom, input.ActiveUntil)
 	if err != nil {
 		return CreateResponse{}, fmt.Errorf("创建短链记录失败: %w", err)
 	}
@@ -244,7 +295,8 @@ func (s *Service) Create(ctx context.Context, actor Actor, input CreateRequest, 
 		return CreateResponse{}, err
 	}
 	if err := audit(ctx, tx, actor.UserID, workspaceID, "link.create", "short_link", linkID.String(), meta, map[string]any{
-		"title": title, "tags": tags, "targetType": input.Target.Type, "businessId": assetBusinessID, "code": code, "expiresAt": input.ExpiresAt,
+		"title": title, "tags": tags, "groupId": responseGroupID, "groupName": responseGroupName, "targetType": input.Target.Type, "businessId": assetBusinessID, "code": code, "expiresAt": input.ExpiresAt,
+		"activeFrom": input.ActiveFrom, "activeUntil": input.ActiveUntil,
 		"maxVisits": rules.MaxVisits, "requirePassword": rules.RequirePassword,
 		"templateId": nullablePublicTemplateID(templateRef), "templateVersion": nullablePublicTemplateVersion(templateRef),
 	}); err != nil {
@@ -253,7 +305,7 @@ func (s *Service) Create(ctx context.Context, actor Actor, input CreateRequest, 
 	if err := tx.Commit(); err != nil {
 		return CreateResponse{}, err
 	}
-	return CreateResponse{LinkID: publicID("link", linkID), BusinessID: assetBusinessID, Title: title, Tags: tags, Code: code, URL: s.linkURL(code), Target: target, ExpiresAt: input.ExpiresAt, Rules: rules, RuleTemplate: templateRef}, nil
+	return CreateResponse{LinkID: publicID("link", linkID), BusinessID: assetBusinessID, Title: title, Tags: tags, GroupID: responseGroupID, GroupName: responseGroupName, Code: code, URL: s.linkURL(code), Target: target, ExpiresAt: input.ExpiresAt, ActiveFrom: input.ActiveFrom, ActiveUntil: input.ActiveUntil, Rules: rules, RuleTemplate: templateRef}, nil
 }
 
 func (s *Service) List(ctx context.Context, actor Actor, page, pageSize int, query map[string]string) (Page, error) {
@@ -261,77 +313,10 @@ func (s *Service) List(ctx context.Context, actor Actor, page, pageSize int, que
 	if page < 1 || pageSize < 1 || pageSize > 100 {
 		return Page{}, problem(422, "invalid_pagination", "分页参数无效")
 	}
-	where := []string{}
-	args := []any{}
-	add := func(clause string, value any) {
-		args = append(args, value)
-		where = append(where, fmt.Sprintf(clause, len(args)))
+	filter, args, err := buildListFilter(actor, query)
+	if err != nil {
+		return Page{}, err
 	}
-	if actor.Role != "admin" {
-		add("sl.workspace_id=$%d", actor.WorkspaceID)
-	} else if workspace := query["workspaceId"]; workspace != "" {
-		id, err := parseID("ws", workspace)
-		if err != nil {
-			return Page{}, problem(422, "invalid_workspace_id", "工作空间参数无效")
-		}
-		add("sl.workspace_id=$%d", id)
-	}
-	if actor.BusinessID != "" {
-		add("sl.business_id=$%d", actor.BusinessID)
-	}
-	for key, column := range map[string]string{"status": "sl.status", "targetType": "sl.target_type", "code": "sc.code"} {
-		if value := query[key]; value != "" {
-			if (key == "status" && value != "enabled" && value != "disabled") || (key == "targetType" && value != "url" && value != "minio_asset") {
-				return Page{}, problem(422, "invalid_filter", "筛选参数无效")
-			}
-			add(column+"=$%d", strings.ToLower(value))
-		}
-	}
-	if keyword := strings.TrimSpace(query["keyword"]); keyword != "" {
-		if len([]rune(keyword)) > 160 {
-			return Page{}, problem(422, "invalid_filter", "关键词不能超过 160 个字符")
-		}
-		args = append(args, keyword)
-		index := len(args)
-		where = append(where, fmt.Sprintf(`(
-			strpos(lower(sl.title),lower($%d))>0 OR
-			strpos(lower(COALESCE(sl.target_url,'')),lower($%d))>0 OR
-			strpos(lower(COALESCE(sc.code,'')),lower($%d))>0 OR
-			EXISTS (SELECT 1 FROM jsonb_array_elements_text(sl.tags) AS labels(value) WHERE strpos(lower(labels.value),lower($%d))>0)
-		)`, index, index, index, index))
-	}
-	if rawAssetID := strings.TrimSpace(query["assetId"]); rawAssetID != "" {
-		assetID, err := parseID("ast", rawAssetID)
-		if err != nil {
-			return Page{}, problem(422, "invalid_asset_id", "素材 ID 格式无效")
-		}
-		add("sl.asset_id=$%d", assetID)
-	}
-	if availability := query["availability"]; availability != "" {
-		availabilitySQL := "CASE WHEN sl.status='disabled' THEN 'disabled' WHEN sl.expires_at IS NOT NULL AND sl.expires_at<=now() THEN 'expired' WHEN sl.max_visits>=0 AND sl.visits_used>=sl.max_visits THEN 'visit_limit_reached' ELSE 'available' END"
-		if availability != "available" && availability != "expired" && availability != "visit_limit_reached" && availability != "disabled" {
-			return Page{}, problem(422, "invalid_filter", "可用状态筛选参数无效")
-		}
-		add(availabilitySQL+"=$%d", availability)
-	}
-	if from := query["createdFrom"]; from != "" {
-		t, err := time.Parse(time.RFC3339, from)
-		if err != nil {
-			return Page{}, problem(422, "invalid_filter", "创建时间参数无效")
-		}
-		add("sl.created_at >= $%d", t)
-	}
-	if to := query["createdTo"]; to != "" {
-		t, err := time.Parse(time.RFC3339, to)
-		if err != nil {
-			return Page{}, problem(422, "invalid_filter", "创建时间参数无效")
-		}
-		add("sl.created_at <= $%d", t)
-	}
-	if len(where) == 0 {
-		where = append(where, "TRUE")
-	}
-	filter := strings.Join(where, " AND ")
 	var total int64
 	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM short_links sl LEFT JOIN short_link_codes sc ON sc.link_id=sl.link_id AND sc.status='active' WHERE `+filter, args...).Scan(&total); err != nil {
 		return Page{}, err
@@ -341,10 +326,11 @@ func (s *Service) List(ctx context.Context, actor Actor, page, pageSize int, que
 		SELECT sl.link_id, sc.code, sl.title, sl.tags::text, sl.target_type, sl.target_url, sl.asset_id,
 		       a.size_bytes, sl.status, sl.expires_at,
 		       sl.visits_used, sl.max_visits, sl.created_at,
-		       CASE WHEN sl.status='disabled' THEN 'disabled' WHEN sl.expires_at IS NOT NULL AND sl.expires_at<=now() THEN 'expired'
-		            WHEN sl.max_visits>=0 AND sl.visits_used>=sl.max_visits THEN 'visit_limit_reached' ELSE 'available' END
+		       `+availabilityExpression+`,
+		       sl.group_id,g.name,sl.active_from,sl.active_until
 		FROM short_links sl LEFT JOIN short_link_codes sc ON sc.link_id=sl.link_id AND sc.status='active'
-		LEFT JOIN assets a ON a.asset_id=sl.asset_id WHERE `+filter+fmt.Sprintf(" ORDER BY sl.created_at DESC LIMIT $%d OFFSET $%d", len(args)-1, len(args)), args...)
+		LEFT JOIN assets a ON a.asset_id=sl.asset_id
+		LEFT JOIN link_groups g ON g.group_id=sl.group_id AND g.workspace_id=sl.workspace_id WHERE `+filter+fmt.Sprintf(" ORDER BY sl.created_at DESC,sl.link_id DESC LIMIT $%d OFFSET $%d", len(args)-1, len(args)), args...)
 	if err != nil {
 		return Page{}, err
 	}
@@ -355,10 +341,10 @@ func (s *Service) List(ctx context.Context, actor Actor, page, pageSize int, que
 		var item ListItem
 		var code sql.NullString
 		var tagsJSON []byte
-		var targetURL, assetID sql.NullString
+		var targetURL, assetID, groupID, groupName sql.NullString
 		var size sql.NullInt64
-		var expires sql.NullTime
-		if err := rows.Scan(&id, &code, &item.Title, &tagsJSON, &item.TargetType, &targetURL, &assetID, &size, &item.Status, &expires, &item.VisitsUsed, &item.MaxVisits, &item.CreatedAt, &item.Availability); err != nil {
+		var expires, activeFrom, activeUntil sql.NullTime
+		if err := rows.Scan(&id, &code, &item.Title, &tagsJSON, &item.TargetType, &targetURL, &assetID, &size, &item.Status, &expires, &item.VisitsUsed, &item.MaxVisits, &item.CreatedAt, &item.Availability, &groupID, &groupName, &activeFrom, &activeUntil); err != nil {
 			return Page{}, err
 		}
 		item.Tags = []string{}
@@ -382,10 +368,10 @@ func (s *Service) List(ctx context.Context, actor Actor, page, pageSize int, que
 				item.AssetID = publicID("ast", parsedID)
 			}
 		}
-		if expires.Valid {
-			value := expires.Time.UTC()
-			item.ExpiresAt = &value
-		}
+		item.ExpiresAt = timePointer(expires)
+		item.ActiveFrom = timePointer(activeFrom)
+		item.ActiveUntil = timePointer(activeUntil)
+		item.GroupID, item.GroupName = publicGroupFields(groupID, groupName)
 		item.CreatedAt = item.CreatedAt.UTC()
 		items = append(items, item)
 	}
@@ -412,13 +398,33 @@ func (s *Service) Get(ctx context.Context, actor Actor, rawID string) (LinkDTO, 
 }
 
 func (s *Service) UpdateMetadata(ctx context.Context, actor Actor, rawID string, input UpdateMetadataRequest, meta RequestMeta) (LinkDTO, error) {
-	// 1. 备注与标签只更新当前短链，不允许触及目标、短码或访问规则。
-	if input.Title == nil || input.Tags == nil {
+	if (input.Title == nil) != (input.Tags == nil) {
 		return LinkDTO{}, problem(422, "invalid_metadata", "title 和 tags 必须同时提供")
 	}
-	title, tags, err := normalizeMetadata(*input.Title, *input.Tags)
-	if err != nil {
-		return LinkDTO{}, err
+	if input.Title == nil && len(input.GroupID) == 0 {
+		return LinkDTO{}, problem(422, "empty_update", "至少提供 title/tags 或 groupId")
+	}
+	var title string
+	var tags []string
+	var err error
+	if input.Title != nil {
+		title, tags, err = normalizeMetadata(*input.Title, *input.Tags)
+		if err != nil {
+			return LinkDTO{}, err
+		}
+	}
+	groupChanged := len(input.GroupID) > 0
+	var requestedGroup *uuid.UUID
+	if groupChanged && strings.TrimSpace(string(input.GroupID)) != "null" {
+		var rawGroup string
+		if err := json.Unmarshal(input.GroupID, &rawGroup); err != nil {
+			return LinkDTO{}, problem(422, "invalid_group_id", "groupId 必须是分组 ID 或 null")
+		}
+		parsed, err := parseID("grp", rawGroup)
+		if err != nil {
+			return LinkDTO{}, problem(404, "group_not_found", "分组不存在或无权访问")
+		}
+		requestedGroup = &parsed
 	}
 	id, err := parseID("link", rawID)
 	if err != nil {
@@ -429,6 +435,11 @@ func (s *Service) UpdateMetadata(ctx context.Context, actor Actor, rawID string,
 		return LinkDTO{}, err
 	}
 	defer tx.Rollback()
+	if requestedGroup != nil {
+		if err := lockGroupMembership(ctx, tx, *requestedGroup, false); err != nil {
+			return LinkDTO{}, err
+		}
+	}
 	r, err := s.loadLink(ctx, tx, id, true)
 	if errors.Is(err, sql.ErrNoRows) {
 		return LinkDTO{}, problem(404, "link_not_found", "短链不存在或无权访问")
@@ -439,26 +450,43 @@ func (s *Service) UpdateMetadata(ctx context.Context, actor Actor, rawID string,
 	if !linkInScope(actor, r) {
 		return LinkDTO{}, problem(404, "link_not_found", "短链不存在或无权访问")
 	}
+	if input.Title == nil {
+		title, tags = r.Title, r.Tags
+	}
+	groupID, groupName := r.GroupID, r.GroupName
+	if groupChanged {
+		groupID, groupName = sql.NullString{}, sql.NullString{}
+		if requestedGroup != nil {
+			groupName, err = validateLinkGroup(ctx, tx, *requestedGroup, r.WorkspaceID)
+			if err != nil {
+				return LinkDTO{}, err
+			}
+			groupID = sql.NullString{String: requestedGroup.String(), Valid: true}
+		}
+	}
 	tagsJSON, _ := json.Marshal(tags)
 	now := time.Now().UTC()
-	if _, err := tx.ExecContext(ctx, `UPDATE short_links SET title=$2,tags=$3::jsonb,updated_at=$4 WHERE link_id=$1`, id, title, string(tagsJSON), now); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE short_links SET title=$2,tags=$3::jsonb,updated_at=$4,group_id=$5 WHERE link_id=$1`, id, title, string(tagsJSON), now, groupID); err != nil {
 		return LinkDTO{}, err
 	}
+	groupBefore, nameBefore := publicGroupFields(r.GroupID, r.GroupName)
+	groupAfter, nameAfter := publicGroupFields(groupID, groupName)
 	if err := audit(ctx, tx, actor.UserID, r.WorkspaceID, "link.metadata.update", "short_link", id.String(), meta, map[string]any{
 		"titleBefore": r.Title, "titleAfter": title, "tagsBefore": r.Tags, "tagsAfter": tags,
+		"groupIdBefore": groupBefore, "groupIdAfter": groupAfter, "groupNameBefore": nameBefore, "groupNameAfter": nameAfter,
 	}); err != nil {
 		return LinkDTO{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return LinkDTO{}, err
 	}
-	r.Title, r.Tags, r.UpdatedAt = title, tags, now
+	r.Title, r.Tags, r.UpdatedAt, r.GroupID, r.GroupName = title, tags, now, groupID, groupName
 	return s.dto(r), nil
 }
 
 func (s *Service) UpdateRules(ctx context.Context, actor Actor, rawID string, input UpdateRulesRequest, meta RequestMeta) (LinkDTO, error) {
 	// 1. 规则按字段合并更新；模板版本只保留为来源记录，规则值仍以短链快照为准。
-	if input.MaxVisits == nil && input.AllowedIPCIDRs == nil && input.RequirePassword == nil && input.AccessPassword == nil && input.WrongPasswordPolicy == nil && len(input.ExpiresAt) == 0 {
+	if input.MaxVisits == nil && input.AllowedIPCIDRs == nil && input.RequirePassword == nil && input.AccessPassword == nil && input.WrongPasswordPolicy == nil && len(input.ExpiresAt) == 0 && len(input.ActiveFrom) == 0 && len(input.ActiveUntil) == 0 {
 		return LinkDTO{}, problem(422, "empty_update", "至少提供一个规则字段")
 	}
 	id, err := parseID("link", rawID)
@@ -480,17 +508,21 @@ func (s *Service) UpdateRules(ctx context.Context, actor Actor, rawID string, in
 	if !linkInScope(actor, r) {
 		return LinkDTO{}, problem(404, "link_not_found", "短链不存在或无权访问")
 	}
-	expiresAt := r.ExpiresAt
-	if len(input.ExpiresAt) > 0 {
-		if strings.TrimSpace(string(input.ExpiresAt)) == "null" {
-			expiresAt = sql.NullTime{}
-		} else {
-			var requested time.Time
-			if err := json.Unmarshal(input.ExpiresAt, &requested); err != nil || requested.IsZero() || !requested.After(time.Now()) {
-				return LinkDTO{}, problem(422, "invalid_expiration", "到期时间必须是合法且晚于当前时间的时间戳，或使用 null 清除到期时间")
-			}
-			expiresAt = sql.NullTime{Time: requested, Valid: true}
-		}
+	now := time.Now().UTC()
+	expiresAt, err := mergeTimePatch(input.ExpiresAt, r.ExpiresAt)
+	if err != nil || (len(input.ExpiresAt) > 0 && expiresAt.Valid && !expiresAt.Time.After(now)) {
+		return LinkDTO{}, problem(422, "invalid_expiration", "到期时间必须是合法且晚于当前时间的时间戳，或使用 null 清除到期时间")
+	}
+	activeFrom, err := mergeTimePatch(input.ActiveFrom, r.ActiveFrom)
+	if err != nil {
+		return LinkDTO{}, problem(422, "invalid_window", "开放开始时间必须是合法的 RFC3339 时间戳，或使用 null 清除")
+	}
+	activeUntil, err := mergeTimePatch(input.ActiveUntil, r.ActiveUntil)
+	if err != nil || (len(input.ActiveUntil) > 0 && activeUntil.Valid && !activeUntil.Time.After(now)) {
+		return LinkDTO{}, problem(422, "invalid_window", "开放结束时间必须是合法且晚于当前时间的时间戳，或使用 null 清除")
+	}
+	if err := validateWindow(activeFrom, activeUntil, expiresAt); err != nil {
+		return LinkDTO{}, err
 	}
 
 	rules := Rules{
@@ -531,8 +563,8 @@ func (s *Service) UpdateRules(ctx context.Context, actor Actor, rawID string, in
 		passwordHash = r.PasswordHash.String
 	}
 	if input.AccessPassword != nil {
-		if !rules.RequirePassword || strings.TrimSpace(*input.AccessPassword) == "" {
-			return LinkDTO{}, problem(422, "invalid_access_password", "启用口令保护时，新口令不能为空")
+		if !rules.RequirePassword || !validAccessPassword(*input.AccessPassword) {
+			return LinkDTO{}, problem(422, "invalid_access_password", "访问口令必须为 1 至 1024 字节且不能全为空白")
 		}
 		hash, err := auth.HashPassword(*input.AccessPassword)
 		if err != nil {
@@ -566,25 +598,14 @@ func (s *Service) UpdateRules(ctx context.Context, actor Actor, rawID string, in
 	if rules.WrongPasswordPolicy != nil {
 		newPolicy = rules.WrongPasswordPolicy.Strategy
 	}
-	var expiresBefore, expiresAfter *time.Time
-	if r.ExpiresAt.Valid {
-		value := r.ExpiresAt.Time.UTC()
-		expiresBefore = &value
-	}
-	if expiresAt.Valid {
-		value := expiresAt.Time.UTC()
-		expiresAfter = &value
-	}
-	now := time.Now().UTC()
-	var expiresValue any
-	if expiresAt.Valid {
-		expiresValue = expiresAt.Time
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE short_links SET expires_at=$2,max_visits=$3,allowed_ip_cidrs=$4::cidr[],require_password=$5,password_hash=$6,wrong_password_policy=$7::jsonb,updated_at=$8 WHERE link_id=$1`, id, expiresValue, rules.MaxVisits, cidrArray(rules.AllowedIPCIDRs), rules.RequirePassword, passwordHash, policyValue, now); err != nil {
+	expiresBefore, expiresAfter := timePointer(r.ExpiresAt), timePointer(expiresAt)
+	if _, err := tx.ExecContext(ctx, `UPDATE short_links SET expires_at=$2,max_visits=$3,allowed_ip_cidrs=$4::cidr[],require_password=$5,password_hash=$6,wrong_password_policy=$7::jsonb,updated_at=$8,active_from=$9,active_until=$10,visits_cycle=CASE WHEN max_visits<>$3 THEN visits_cycle+1 ELSE visits_cycle END WHERE link_id=$1`, id, expiresAfter, rules.MaxVisits, cidrArray(rules.AllowedIPCIDRs), rules.RequirePassword, passwordHash, policyValue, now, timePointer(activeFrom), timePointer(activeUntil)); err != nil {
 		return LinkDTO{}, err
 	}
 	if err := audit(ctx, tx, actor.UserID, r.WorkspaceID, "link.rules.update", "short_link", id.String(), meta, map[string]any{
 		"expiresAtBefore": expiresBefore, "expiresAtAfter": expiresAfter,
+		"activeFromBefore": timePointer(r.ActiveFrom), "activeFromAfter": timePointer(activeFrom),
+		"activeUntilBefore": timePointer(r.ActiveUntil), "activeUntilAfter": timePointer(activeUntil),
 		"maxVisitsBefore": r.MaxVisits, "maxVisitsAfter": rules.MaxVisits,
 		"allowedIpCidrsBefore": parseCIDRArray(r.IPCIDRs), "allowedIpCidrsAfter": rules.AllowedIPCIDRs,
 		"requirePasswordBefore": r.RequirePassword, "requirePasswordAfter": rules.RequirePassword,
@@ -596,6 +617,8 @@ func (s *Service) UpdateRules(ctx context.Context, actor Actor, rawID string, in
 		return LinkDTO{}, err
 	}
 	r.ExpiresAt = expiresAt
+	r.ActiveFrom = activeFrom
+	r.ActiveUntil = activeUntil
 	r.MaxVisits = rules.MaxVisits
 	r.IPCIDRs = cidrArray(rules.AllowedIPCIDRs)
 	r.RequirePassword = rules.RequirePassword
@@ -611,6 +634,7 @@ func (s *Service) UpdateRules(ctx context.Context, actor Actor, rawID string, in
 
 func (s *Service) Renew(ctx context.Context, actor Actor, rawID string, input RenewRequest, meta RequestMeta) (map[string]any, error) {
 	// 1. 续期只更新到期时间；仅显式选择 generated 时才更换入口码。
+	input.ExpiresAt = input.ExpiresAt.UTC().Truncate(time.Microsecond)
 	if !input.ExpiresAt.After(time.Now()) {
 		return nil, problem(422, "invalid_expiration", "到期时间必须晚于当前时间")
 	}
@@ -638,6 +662,12 @@ func (s *Service) Renew(ctx context.Context, actor Actor, rawID string, input Re
 	}
 	if !linkInScope(actor, r) {
 		return nil, problem(404, "link_not_found", "短链不存在或无权访问")
+	}
+	if !input.ExpiresAt.After(time.Now()) {
+		return nil, problem(422, "invalid_expiration", "到期时间必须晚于当前时间")
+	}
+	if err := validateWindow(r.ActiveFrom, r.ActiveUntil, nullTime(&input.ExpiresAt)); err != nil {
+		return nil, err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE short_links SET expires_at=$2,updated_at=now() WHERE link_id=$1`, id, input.ExpiresAt); err != nil {
 		return nil, err
@@ -768,7 +798,7 @@ func (s *Service) ResetVisits(ctx context.Context, actor Actor, rawID string, me
 		return nil, problem(404, "link_not_found", "短链不存在或无权访问")
 	}
 	now := time.Now().UTC()
-	if _, err = tx.ExecContext(ctx, `UPDATE short_links SET visits_used=0,updated_at=$2 WHERE link_id=$1`, id, now); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE short_links SET visits_used=0,visits_cycle=visits_cycle+1,updated_at=$2 WHERE link_id=$1`, id, now); err != nil {
 		return nil, err
 	}
 	if err := audit(ctx, tx, actor.UserID, r.WorkspaceID, "link.reset_visits", "short_link", id.String(), meta, map[string]any{"previousVisitsUsed": r.VisitsUsed, "visitsUsed": 0, "maxVisits": r.MaxVisits}); err != nil {
@@ -904,7 +934,7 @@ func (s *Service) loadLink(ctx context.Context, q interface {
 	}
 	var r linkRecord
 	var tagsJSON []byte
-	err := q.QueryRowContext(ctx, `SELECT sl.link_id,sl.workspace_id,COALESCE(sl.business_id,a.business_id,''),sl.target_type,sl.target_url,sl.asset_id,a.size_bytes,a.bucket,a.object_key,a.original_name,a.content_type,sl.expires_at,sl.max_visits,sl.visits_used,sl.allowed_ip_cidrs::text,sl.require_password,sl.password_hash,sl.wrong_password_policy,sl.status,sl.template_id,sl.template_version,sc.code,sc.status,sl.created_at,sl.updated_at,sl.title,sl.tags::text FROM short_links sl LEFT JOIN assets a ON a.asset_id=sl.asset_id LEFT JOIN short_link_codes sc ON sc.link_id=sl.link_id AND sc.status='active' WHERE sl.link_id=$1`+suffix, id).Scan(&r.ID, &r.WorkspaceID, &r.BusinessID, &r.TargetType, &r.TargetURL, &r.AssetID, &r.AssetSize, &r.Bucket, &r.ObjectKey, &r.OriginalName, &r.ContentType, &r.ExpiresAt, &r.MaxVisits, &r.VisitsUsed, &r.IPCIDRs, &r.RequirePassword, &r.PasswordHash, &r.PolicyJSON, &r.Status, &r.TemplateID, &r.TemplateVersion, &r.Code, &r.CodeStatus, &r.CreatedAt, &r.UpdatedAt, &r.Title, &tagsJSON)
+	err := q.QueryRowContext(ctx, `SELECT sl.link_id,sl.workspace_id,COALESCE(sl.business_id,a.business_id,''),sl.target_type,sl.target_url,sl.asset_id,a.size_bytes,a.bucket,a.object_key,a.original_name,a.content_type,sl.expires_at,sl.max_visits,sl.visits_used,sl.allowed_ip_cidrs::text,sl.require_password,sl.password_hash,sl.wrong_password_policy,sl.status,sl.template_id,sl.template_version,sc.code,sc.status,sl.created_at,sl.updated_at,sl.title,sl.tags::text,sl.group_id,g.name,sl.active_from,sl.active_until FROM short_links sl LEFT JOIN assets a ON a.asset_id=sl.asset_id LEFT JOIN short_link_codes sc ON sc.link_id=sl.link_id AND sc.status='active' LEFT JOIN link_groups g ON g.group_id=sl.group_id AND g.workspace_id=sl.workspace_id WHERE sl.link_id=$1`+suffix, id).Scan(&r.ID, &r.WorkspaceID, &r.BusinessID, &r.TargetType, &r.TargetURL, &r.AssetID, &r.AssetSize, &r.Bucket, &r.ObjectKey, &r.OriginalName, &r.ContentType, &r.ExpiresAt, &r.MaxVisits, &r.VisitsUsed, &r.IPCIDRs, &r.RequirePassword, &r.PasswordHash, &r.PolicyJSON, &r.Status, &r.TemplateID, &r.TemplateVersion, &r.Code, &r.CodeStatus, &r.CreatedAt, &r.UpdatedAt, &r.Title, &tagsJSON, &r.GroupID, &r.GroupName, &r.ActiveFrom, &r.ActiveUntil)
 	if err == nil {
 		r.Tags = []string{}
 		err = json.Unmarshal(tagsJSON, &r.Tags)
@@ -931,11 +961,7 @@ func (s *Service) dto(r linkRecord) LinkDTO {
 	if len(r.PolicyJSON) > 0 {
 		_ = json.Unmarshal(r.PolicyJSON, &rules.WrongPasswordPolicy)
 	}
-	var expires *time.Time
-	if r.ExpiresAt.Valid {
-		value := r.ExpiresAt.Time.UTC()
-		expires = &value
-	}
+	expires := timePointer(r.ExpiresAt)
 	var ref *TemplateRef
 	if r.TemplateID.Valid {
 		if id, err := uuid.Parse(r.TemplateID.String); err == nil {
@@ -947,7 +973,12 @@ func (s *Service) dto(r linkRecord) LinkDTO {
 	if r.Code.Valid {
 		code = r.Code.String
 	}
-	return LinkDTO{LinkID: publicID("link", r.ID), BusinessID: r.BusinessID, Title: r.Title, Tags: r.Tags, Code: code, URL: s.linkURL(code), Target: target, Status: r.Status, Availability: availability(r), Rules: rules, ExpiresAt: expires, VisitsUsed: r.VisitsUsed, RuleTemplate: ref, CreatedAt: r.CreatedAt.UTC(), UpdatedAt: r.UpdatedAt.UTC()}
+	groupID, groupName := publicGroupFields(r.GroupID, r.GroupName)
+	return LinkDTO{LinkID: publicID("link", r.ID), BusinessID: r.BusinessID, Title: r.Title, Tags: r.Tags, GroupID: groupID, GroupName: groupName, Code: code, URL: s.linkURL(code), Target: target, Status: r.Status, Availability: availability(r), Rules: rules, ExpiresAt: expires, ActiveFrom: timePointer(r.ActiveFrom), ActiveUntil: timePointer(r.ActiveUntil), VisitsUsed: r.VisitsUsed, RuleTemplate: ref, CreatedAt: r.CreatedAt.UTC(), UpdatedAt: r.UpdatedAt.UTC()}
+}
+
+func validAccessPassword(password string) bool {
+	return len(password) <= 1024 && strings.TrimSpace(password) != ""
 }
 
 func linkInScope(actor Actor, record linkRecord) bool {
@@ -988,6 +1019,16 @@ func (s *Service) Access(ctx context.Context, rawCode string, meta RequestMeta, 
 	} else if err != nil {
 		return PublicResult{}, err
 	}
+	if reason := precheckAccessReason(r, codeStatus, meta.SourceIP, s.accessNow()); reason != "" {
+		result, err := s.denyAccess(ctx, tx, r, meta, reason)
+		if err != nil {
+			return PublicResult{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return PublicResult{}, err
+		}
+		return result, nil
+	}
 	if submit && r.RequirePassword {
 		result, err := s.passwordAccess(ctx, tx, r, codeStatus, meta, password)
 		if err != nil {
@@ -998,7 +1039,7 @@ func (s *Service) Access(ctx context.Context, rawCode string, meta RequestMeta, 
 		}
 		return result, nil
 	}
-	if r.RequirePassword && !submit && codeStatus == "active" && r.Status == "enabled" && (!r.ExpiresAt.Valid || r.ExpiresAt.Time.After(time.Now())) {
+	if r.RequirePassword && !submit {
 		if _, err := s.logAccess(ctx, tx, r, meta, "challenge", "password_required", false, "link_access"); err != nil {
 			return PublicResult{}, err
 		}
@@ -1019,8 +1060,8 @@ func (s *Service) Access(ctx context.Context, rawCode string, meta RequestMeta, 
 
 func (s *Service) passwordAccess(ctx context.Context, tx *sql.Tx, r linkRecord, codeStatus string, meta RequestMeta, password string) (PublicResult, error) {
 	// 1. 口令错误和冷却只写密码尝试日志，不消耗短链 visits_used。
-	if codeStatus != "active" || r.Status != "enabled" || (r.ExpiresAt.Valid && !r.ExpiresAt.Time.After(time.Now())) {
-		return s.consumeAccess(ctx, tx, r, codeStatus, meta)
+	if reason := precheckAccessReason(r, codeStatus, meta.SourceIP, s.accessNow()); reason != "" {
+		return s.denyAccess(ctx, tx, r, meta, reason)
 	}
 	ip := normalizedIP(meta.SourceIP)
 	var window time.Time
@@ -1085,37 +1126,15 @@ func (s *Service) passwordAccess(ctx context.Context, tx *sql.Tx, r linkRecord, 
 }
 
 func (s *Service) consumeAccess(ctx context.Context, tx *sql.Tx, r linkRecord, codeStatus string, meta RequestMeta) (PublicResult, error) {
-	// 1. 在同一事务锁内按请求到达前计数判断，再无论放行与否都增加访问尝试。
-	reason := ""
-	status := 200
-	if codeStatus != "active" {
-		reason = "code_revoked"
-		status = 410
-	} else if r.Status != "enabled" {
-		reason = "disabled"
-		status = 410
-	} else if r.ExpiresAt.Valid && !r.ExpiresAt.Time.After(time.Now()) {
-		reason = "expired"
-		status = 410
-	} else if r.MaxVisits == 0 || (r.MaxVisits > 0 && r.VisitsUsed >= r.MaxVisits) {
-		reason = "visit_limit_reached"
-		status = 403
-	} else if !ipAllowed(r.IPCIDRs, meta.SourceIP) {
-		reason = "ip_denied"
-		status = 403
+	// 1. 在短链行锁内按原有优先级检查规则；拒绝只写日志，不消耗访问次数。
+	if reason := precheckAccessReason(r, codeStatus, meta.SourceIP, s.accessNow()); reason != "" {
+		return s.denyAccess(ctx, tx, r, meta, reason)
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE short_links SET visits_used=visits_used+1 WHERE link_id=$1`, r.ID); err != nil {
-		return PublicResult{}, err
-	}
-	eventID, err := s.logAccess(ctx, tx, r, meta, map[bool]string{true: "allowed", false: "denied"}[reason == ""], reason, true, "link_access")
-	if err != nil {
-		return PublicResult{}, err
-	}
-	if reason != "" {
-		return page(status, publicReason(reason), publicMessage(reason)), nil
-	}
+
+	// 2. 先准备可用的 302 Location，素材删除、未配置存储或签名失败均不扣次。
+	location := ""
 	if r.TargetType == "url" && r.TargetURL.Valid {
-		return PublicResult{StatusCode: 302, Location: r.TargetURL.String}, nil
+		location = r.TargetURL.String
 	}
 	if r.TargetType == "minio_asset" && r.AssetID.Valid {
 		var assetAvailable bool
@@ -1123,16 +1142,33 @@ func (s *Service) consumeAccess(ctx context.Context, tx *sql.Tx, r linkRecord, c
 			return PublicResult{}, err
 		}
 		if assetAvailable && r.Bucket.Valid && r.ObjectKey.Valid && s.store != nil {
-			location, err := s.store.PresignedGet(ctx, r.Bucket.String, r.ObjectKey.String, 15*time.Minute, r.ContentType.String, r.OriginalName.String)
+			signed, err := s.store.PresignedGet(ctx, r.Bucket.String, r.ObjectKey.String, 15*time.Minute, r.ContentType.String, r.OriginalName.String)
 			if err == nil {
-				return PublicResult{StatusCode: 302, Location: location}, nil
+				location = signed
 			}
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE short_link_access_logs SET result='denied',reason='asset_unavailable' WHERE event_id=$1`, eventID); err != nil {
+	parsed, err := url.ParseRequestURI(location)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "https" && (r.TargetType != "minio_asset" || parsed.Scheme != "http")) {
+		if _, err := s.logAccess(ctx, tx, r, meta, "denied", "asset_unavailable", false, "link_access"); err != nil {
+			return PublicResult{}, err
+		}
+		return page(503, "目标暂不可用", "链接目标当前无法访问，请稍后重试。"), nil
+	}
+
+	// 3. 签名可能跨过截止时间，在扣次前重新检查当前可用性。
+	if reason := precheckAccessReason(r, codeStatus, meta.SourceIP, s.accessNow()); reason != "" {
+		return s.denyAccess(ctx, tx, r, meta, reason)
+	}
+
+	// 4. 计数与放行事实共用事务，调用方提交成功后才能返回 302。
+	if _, err := tx.ExecContext(ctx, `UPDATE short_links SET visits_used=visits_used+1 WHERE link_id=$1`, r.ID); err != nil {
 		return PublicResult{}, err
 	}
-	return page(503, "目标暂不可用", "链接目标当前无法访问，请稍后重试。"), nil
+	if _, err := s.logAccess(ctx, tx, r, meta, "allowed", "", true, "link_access"); err != nil {
+		return PublicResult{}, err
+	}
+	return PublicResult{StatusCode: 302, Location: location}, nil
 }
 
 func (s *Service) logAccess(ctx context.Context, tx *sql.Tx, r linkRecord, meta RequestMeta, result, reason string, consumes bool, eventType string) (int64, error) {
@@ -1167,16 +1203,88 @@ func (s *Service) linkURL(code string) string {
 }
 
 func availability(r linkRecord) string {
+	return availabilityAt(r, time.Now())
+}
+
+func availabilityAt(r linkRecord, now time.Time) string {
 	if r.Status == "disabled" {
 		return "disabled"
 	}
-	if r.ExpiresAt.Valid && !r.ExpiresAt.Time.After(time.Now()) {
+	if r.ExpiresAt.Valid && !r.ExpiresAt.Time.After(now) {
 		return "expired"
+	}
+	if r.ActiveUntil.Valid && !r.ActiveUntil.Time.After(now) {
+		return "window_ended"
+	}
+	if r.ActiveFrom.Valid && r.ActiveFrom.Time.After(now) {
+		return "not_started"
 	}
 	if r.MaxVisits >= 0 && r.VisitsUsed >= r.MaxVisits {
 		return "visit_limit_reached"
 	}
 	return "available"
+}
+
+func precheckAccessReason(r linkRecord, codeStatus, sourceIP string, now time.Time) string {
+	if codeStatus != "active" {
+		return "code_revoked"
+	}
+	if state := availabilityAt(r, now); state != "available" {
+		return state
+	}
+	if !ipAllowed(r.IPCIDRs, sourceIP) {
+		return "ip_denied"
+	}
+	return ""
+}
+
+func (s *Service) denyAccess(ctx context.Context, tx *sql.Tx, r linkRecord, meta RequestMeta, reason string) (PublicResult, error) {
+	if _, err := s.logAccess(ctx, tx, r, meta, "denied", reason, false, "link_access"); err != nil {
+		return PublicResult{}, err
+	}
+	status := 410
+	if reason == "not_started" || reason == "visit_limit_reached" || reason == "ip_denied" {
+		status = 403
+	}
+	return page(status, publicReason(reason), publicMessage(reason)), nil
+}
+
+func validateWindow(activeFrom, activeUntil, expiresAt sql.NullTime) error {
+	deadline := expiresAt
+	if activeUntil.Valid && (!deadline.Valid || activeUntil.Time.Before(deadline.Time)) {
+		deadline = activeUntil
+	}
+	if activeFrom.Valid && deadline.Valid && !activeFrom.Time.Before(deadline.Time) {
+		return problem(422, "invalid_window", "开放开始时间必须早于到期时间与开放结束时间中较早者")
+	}
+	return nil
+}
+
+func mergeTimePatch(raw json.RawMessage, current sql.NullTime) (sql.NullTime, error) {
+	if len(raw) == 0 {
+		return current, nil
+	}
+	var requested *time.Time
+	if err := json.Unmarshal(raw, &requested); err != nil {
+		return sql.NullTime{}, err
+	}
+	return nullTime(requested), nil
+}
+
+func nullTime(value *time.Time) sql.NullTime {
+	if value == nil {
+		return sql.NullTime{}
+	}
+	// timestamptz 仅保留微秒，按实际写入值校验并返回时间。
+	return sql.NullTime{Time: value.UTC().Truncate(time.Microsecond), Valid: true}
+}
+
+func timePointer(value sql.NullTime) *time.Time {
+	if !value.Valid {
+		return nil
+	}
+	utc := value.Time.UTC()
+	return &utc
 }
 
 func page(status int, title, text string) PublicResult {
@@ -1189,6 +1297,10 @@ func publicReason(reason string) string {
 		return "短链已停用"
 	case "expired":
 		return "短链已过期"
+	case "window_ended":
+		return "短链开放窗口已结束"
+	case "not_started":
+		return "短链尚未开放"
 	case "visit_limit_reached":
 		return "访问次数已用尽"
 	case "ip_denied":
@@ -1205,6 +1317,10 @@ func publicMessage(reason string) string {
 		return "分享者已停用此短链。"
 	case "expired":
 		return "此短链已超过有效期。"
+	case "window_ended":
+		return "此短链的开放窗口已结束。"
+	case "not_started":
+		return "此短链尚未到开放时间。"
 	case "visit_limit_reached":
 		return "此短链已达到访问次数限制。"
 	case "ip_denied":
